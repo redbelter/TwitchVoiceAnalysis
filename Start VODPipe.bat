@@ -2,6 +2,10 @@
 setlocal
 cd /d "%~dp0"
 
+rem ---- prefer the app-local venv; fall back to PATH python ----
+set "PY=python"
+if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
+
 rem ---- per-machine settings (create vodpipe.local.bat next to this file, see README) ----
 if exist "%~dp0vodpipe.local.bat" call "%~dp0vodpipe.local.bat"
 
@@ -10,7 +14,7 @@ curl -s -o nul http://127.0.0.1:5001/api/jobs
 if %errorlevel%==0 goto open
 
 echo Starting VODPipe server (minimized window = live log)...
-start "VODPipe server" /min python vodpipe_web.py --port 5001
+start "VODPipe server" /min "%PY%" vodpipe_web.py --port 5001
 timeout /t 4 /nobreak >nul
 
 :open
