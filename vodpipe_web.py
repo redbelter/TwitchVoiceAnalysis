@@ -75,12 +75,23 @@ async def api_new(payload: dict):
     return {"job": jid, "started_pid": p.pid}
 
 
+@app.post("/api/job/{jid}/cancel")
+def api_cancel(jid: str):
+    job_dir(jid)
+    import vodpipe as vp
+    return vp.cancel_job(WORKDIR, jid)
+
+
 @app.get("/api/job/{jid}")
 def api_job(jid: str):
     d = job_dir(jid)
     st = json.loads((d / "state.json").read_text(encoding="utf-8"))
     st["_artifacts"] = {n: (d / n).exists() for n in
                         ("labeled.txt", "people.json", "scan_flirting.txt")}
+    # live download size while the mp4 is still a .part (largest wins —
+    # stale parts from earlier runs can coexist)
+    parts = list(d.glob("*.part"))
+    st["_partial_mb"] = round(max((p.stat().st_size for p in parts), default=0) / 1048576)
     return st
 
 
@@ -225,12 +236,41 @@ async function openJob(id){
 async function jobTick(){
  if(_jobId===null||!$('#prog'))return;
  const J=await j('/api/job/'+_jobId);
- const st=J.stages||{};let n=0,running=null;
- for(const s of STAGES){const v=st[s];if(v&&v.status==='done')n++;
-  else if(v&&(v.status==='running')&&!running)running=s;}
- const chips=STAGES.map(s=>{const v=st[s];return `<span class="st ${v?v.status:''}">${s}</span>`}).join('');
- $('#prog').innerHTML=`<div class=bar><i style="width:${n/STAGES.length*100}%"></i></div>${chips}
-  ${running?`<div style="font-size:12px;color:var(--muted-foreground);margin-top:4px">${running}: ${esc(st[running].last||'…')}</div>`:''}`;
+ const st=J.stages||{};
+ let n=0,act=null;
+ for(const s of STAGES){const v=st[s];
+  if(v&&v.status==='done')n++;
+  else if(!act){const subs=Object.keys(st).filter(k=>k.startsWith(s+':'));
+   const rs=subs.find(k=>st[k].status==='running');
+   if(rs)act={key:rs,stage:s,sub:parseInt(rs.split(':')[1]),total:subs.length};
+   else if(v&&v.status==='running')act={key:s,stage:s,sub:null,total:1};}}
+ const running=act?act.stage:null;
+ const chips=STAGES.map(s=>{const v=st[s];
+  let d=0,t=1;const subs=Object.keys(st).filter(k=>k.startsWith(s+':'));
+  if(subs.length){d=subs.filter(k=>st[k].status==='done').length;t=subs.length;}
+  return `<span class="st ${v?v.status:''}">${s}${t>1?' '+d+'/'+t:''}</span>`}).join('');
+ const a=act&&!J.cancelled?st[act.key]:null;
+ const p=(a&&a.prog)||{};
+ let frac=0;
+ if(a)frac=((act.total>1)?((act.sub+(p.pct!=null?p.pct/100:0))/act.total)
+        :(p.pct!=null?p.pct/100:0))/STAGES.length;
+ $('#prog').innerHTML=`<div class=bar><i style="width:${Math.min(100,(n/STAGES.length+frac)*100)}%"></i></div>${chips}`;
+ if(J.cancelled)$('#prog').innerHTML+=`<div style="font-size:12px;color:#ff7b72;margin-top:4px">cancelled — re-run the launcher to resume from cache</div>`;
+ else if(Object.values(st).some(v=>v.status==='failed'))
+  $('#prog').innerHTML+=`<div style="font-size:12px;color:#ff7b72;margin-top:4px">failed — see log below; fix the cause and re-run resumes from cache</div>`;
+ if(a){
+  const parts=[];
+  if(p.pct!=null)parts.push(p.pct.toFixed(1)+'%');
+  if(p.rate)parts.push(p.rate);
+  if(p.eta&&p.eta!=='?')parts.push('ETA '+p.eta);
+  if(act.total>1)parts.push('item '+(act.sub+1)+'/'+act.total);
+  if(J._partial_mb!=null)parts.push(J._partial_mb+' MB so far');
+  if(a.started)parts.push('elapsed '+hms(Date.now()/1000-a.started));
+  $('#prog').innerHTML+=`<div style="font-size:12px;color:var(--muted-foreground);margin-top:4px">
+   running <b>${esc(act.key)}</b> — ${esc(a.last||'starting…')}
+   <button onclick=cancelJob() style="margin-left:8px;padding:2px 10px;font-size:11px">cancel job</button></div>
+   ${parts.length?`<div style="font-size:12px;color:var(--accent,#8b8bff)">${parts.join(' · ')}</div>`:''}`;}
+ else $('#prog').innerHTML+=`<div style="font-size:12px;color:var(--muted-foreground);margin-top:4px">${J.cancelled?'stopped':(n===STAGES.length?'complete — all results below':'not running — re-run the launcher to resume from cache')}</div>`;
 
  /* live log tail for whichever stage is current */
  const cur=running||STAGES.find(s=>st[s]&&st[s].status==='failed');
@@ -271,6 +311,11 @@ async function openLane(nm,keep){
  box.innerHTML=html;
  const t=await j(`/api/job/${_jobId}/transcript?lane=${encodeURIComponent(nm)}&limit=500`);
  $('#laneHits').innerHTML=t.lines.map(l=>`<tr><td class=t>${hms(l.t)}</td><td>${esc(l.text)}</td></tr>`).join('');
+}
+async function cancelJob(){
+ if(!confirm('Cancel this job? Downloaded/transcribed work stays on disk; re-running resumes.'))return;
+ const r=await j(`/api/job/${_jobId}/cancel`,{method:'POST'});
+ console.log(r);setTimeout(jobTick,800);
 }
 async function doSearch(){
  const q=$('#q').value.trim(),lane=$('#laneF').value;

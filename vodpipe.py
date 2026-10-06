@@ -13,16 +13,19 @@ job_id is ASCII ("v<digits>" / "c<clip>" / hash for local files) — VOD titles
 contain Unicode look-alikes and '!' that break shell/ffprobe quoting.
 
 Stages (idempotent; skipped when the artifact exists):
-  download   twitch_dl.py                 -> *.mp4
-  audio      ffmpeg 16k mono              -> audio.mp3
-  transcribe twitch_transcribe.py         -> transcript.json/.txt/.srt
-  diarize    chunk_diar.py      [DIAR py] -> rttm.json   (speech-activity VAD)
-  voiceprint vp_cluster.py     [DIAR py]  -> vp_emb2.npy + vp_lab2.npy
-  label      label_voices.py              -> labeled.txt + people.json
-  solos      solo_track.py per lane>=20   -> solo_N_solo.wav (+timeline.json)
-  reasr      twitch_transcribe.py each    -> solo_N_solo.json/.txt
-  clean      map_clean.py per lane        -> <label>_clean.txt (orig timestamps)
-  scan       flirt_scan.py                -> scan_flirting.txt
+ download   twitch_dl.py                 -> *.mp4
+ audio      ffmpeg 16k mono              -> audio.mp3
+ transcribe twitch_transcribe.py         -> transcript.json/.txt/.srt
+ diarize    chunk_diar.py      [DIAR py] -> rttm.json   (speech-activity VAD)
+ voiceprint vp_cluster.py     [DIAR py]  -> vp_emb2.npy + vp_lab2.npy
+ label      label_voices.py              -> labeled.txt + people.json
+ solos      solo_track.py per lane>=20   -> solo_N_solo.wav (+timeline.json)
+ reasr      twitch_transcribe.py each    -> solo_N_solo.json/.txt
+ clean      map_clean.py per lane        -> <label>_clean.txt (orig timestamps)
+ scan       flirt_scan.py                -> scan_flirting.txt
+
+Cancel any time:  python vodpipe.py --cancel <job>   (also a button in the web
+UI). Artifacts survive; re-running the same command resumes from cache.
 
 --diar-python (or env VODPIPE_DIAR_PY) = a venv python that has nemo_toolkit
 installed. Download/transcribe/label stages run under the current interpreter.
@@ -98,8 +101,23 @@ class Job:
         return next(self.dir.glob("*.mp4"), None)
 
 
+_pct_re = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+_eta_re = re.compile(r"ETA[:\s]+([0-9]{1,2}:?[0-9:]{2,7}|\?+)")
+_rate_re = re.compile(r"([\d.]+\s*[KMG]?i?B/s)|([\d.]+)\s*x\s*RT")
+
+
+def pid_alive(pid):
+    try:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {int(pid)}"],
+                             capture_output=True, text=True).stdout
+        return str(int(pid)) in out
+    except Exception:
+        return False
+
+
 def run(cmd, log, stage, job):
     print(f"[vodpipe] $ {' '.join(str(c) for c in cmd)}")
+    prog = job.stage(stage).setdefault("prog", {})
     with open(log, "a", encoding="utf-8", errors="replace") as lf:
         lf.write(f"\n===== {time.strftime('%F %T')} :: {stage} =====\n")
         lf.flush()
@@ -110,10 +128,75 @@ def run(cmd, log, stage, job):
             lf.write(line)
             if line.startswith("[") and "] " in line[:15]:
                 print("    " + line.rstrip()[:120])
-                job.stage(stage)["last"] = line.split("]", 1)[1].strip()[:160]
+                st = job.stage(stage)
+                st["last"] = line.split("]", 1)[1].strip()[:160]
+                m = _pct_re.search(line)
+                if m:
+                    prog["pct"] = float(m.group(1))
+                m = _eta_re.search(line)
+                if m:
+                    prog["eta"] = m.group(1)
+                m = _rate_re.search(line)
+                if m:
+                    prog["rate"] = (m.group(1) or m.group(2) + "x RT").strip()
+                st["updated"] = time.time()
+                job.save()
         rc = p.wait()
         lf.write(f"----- exit {rc}\n")
     return rc
+
+
+def find_runner_pids(job):
+    """Orchestrator pids running this job: recorded pid first, then a cmdline
+    scan fallback for jobs started before runner_pid existed."""
+    pids = []
+    p = job.st.get("runner_pid")
+    if p and pid_alive(p):
+        return [int(p)]
+    target = job.st.get("url") or ""
+    if not target and job.st.get("input"):
+        target = Path(job.st["input"]).name
+    if not target:
+        return []
+    try:
+        out = subprocess.run(["wmic", "process", "where", "name like '%python%'",
+                              "get", "processid,commandline"],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if "vodpipe.py" in line and target in line:
+                tok = line.rsplit(None, 1)[-1]
+                if tok.isdigit():
+                    pids.append(int(tok))
+    except FileNotFoundError:
+        pass
+    return pids
+
+
+def cancel_job(workdir: Path, jid: str):
+    """Kill the orchestrator process tree and mark running stages cancelled.
+    Artifacts on disk stay; re-running the same command resumes from cache.
+    (State fields lost to a stale-save race are cosmetic only — every stage's
+    done-check is artifact-based, so a mis-marked 'cancelled' self-heals.)"""
+    job = Job(workdir, jid)
+    pids = find_runner_pids(job)
+    killed = []
+    for p in pids:
+        r = subprocess.run(["taskkill", "/PID", str(p), "/T", "/F"],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            killed.append(p)
+    if killed:
+        time.sleep(1.0)  # let the OS reclaim the tree before we rewrite state
+    job = Job(workdir, jid)          # reload: runner may have saved while dying
+    changed = []
+    for k, v in job.st.get("stages", {}).items():
+        if v.get("status") == "running":
+            v["status"] = "cancelled"
+            changed.append(k)
+    job.st["cancelled"] = True
+    job.st["runner_pid"] = None
+    job.save()
+    return {"killed_pids": killed, "cancelled_stages": changed}
 
 
 def rttm_covers(job):
@@ -183,19 +266,19 @@ def stage_plan(job, name):
                  if nm != "STREAMER" and p["n_segments"] >= job.st.get("min_segs", 20)]
         job.st["lanes"] = lanes
         job.save()
-        return [(f"cut{i}",
+        return [(f"solos:{i}",
                  [py, HERE / "solo_track.py", audio, tj, d / "labeled.txt",
                   d / f"solo_{i}", f"--cluster={nm}"],
                  lambda i=i: J(d / f"solo_{i}_solo.wav"))
                 for i, nm in enumerate(lanes)]
     if name == "reasr":
-        return [(f"reasr{i}",
+        return [(f"reasr:{i}",
                  [py, HERE / "twitch_transcribe.py", d / f"solo_{i}_solo.wav",
                   "-m", "large-v3", "--lang", job.st.get("lang", "en")],
                  lambda i=i: J(d / f"solo_{i}_solo.json"))
                 for i in range(len(job.st.get("lanes", [])))]
     if name == "clean":
-        return [(f"clean{i}",
+        return [(f"clean:{i}",
                  [py, HERE / "map_clean.py", d / f"solo_{i}"],
                  lambda i=i: J(d / f"solo_{i}_clean.txt"))
                 for i in range(len(job.st.get("lanes", [])))]
@@ -239,9 +322,14 @@ def main():
                     help="minimum segments for a lane to get a solo track")
     ap.add_argument("--jobs", action="store_true")
     ap.add_argument("--status", metavar="JOB")
+    ap.add_argument("--cancel", metavar="JOB")
     ap.add_argument("--stage", nargs=2, metavar=("NAME", "JOB"))
     ns = ap.parse_args()
     workdir = Path(ns.workdir)
+
+    if ns.cancel:
+        print(json.dumps(cancel_job(workdir, ns.cancel), indent=1))
+        return
 
     if ns.jobs:
         for sp in sorted(workdir.glob("*/state.json")):
@@ -280,6 +368,9 @@ def main():
 
     lk = acquire_lock(workdir, jid)
     try:
+        job.st["cancelled"] = False
+        job.st["runner_pid"] = os.getpid()
+        job.save()
         for name in STAGES:
             # keep duration fresh (needs source, appears after download)
             src = job.source()
@@ -292,14 +383,12 @@ def main():
             if name == "diarize" and not job.st.get("duration"):
                 sys.exit("[vodpipe] could not probe source duration — diarize needs it")
             plan = stage_plan(job, name)
-            all_ok = True
-            ran = False
             for tag, cmd, done_fn in plan:
                 if done_fn():
                     job.set(tag, "done", note="cached")
                     continue
-                ran = True
                 t0 = time.time()
+                job.set(tag, "running", started=t0, prog={})
                 rc = run(cmd, job.dir / "logs" / f"{name}.log", tag, job)
                 if rc != 0:
                     job.set(tag, "failed", rc=rc)
@@ -313,10 +402,8 @@ def main():
                     job.set(tag, "failed", rc=0, note="exit 0 but artifact missing")
                     sys.exit(f"[vodpipe] {tag} produced no artifact — see logs/")
                 job.set(tag, "done", secs=round(time.time() - t0))
-                all_ok = False  # ran something
-            job.set(name, "done" if not ran else "done")
-            print(f"[vodpipe] ✓ {name}"
-                  + (f" ({job.stage(name).get('secs')}s)" if 'secs' in job.stage(name) else ""))
+            job.set(name, "done", secs=None)
+            print(f"[vodpipe] ✓ {name}")
         print(f"[vodpipe] JOB COMPLETE: {job.dir}")
     finally:
         lk = workdir / "gpu.lock"

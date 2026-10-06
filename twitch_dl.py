@@ -59,10 +59,14 @@ def main():
         sys.exit(run_ytdlp(["-F", url]).returncode)
 
     sel = f"bv*[height<={ns.height}]+ba/best" if ns.height else "bv+ba/best"
-    outtmpl = str(Path(ns.output) / "%(title)s [%(id)s].%(ext)s")
+    # Stable filename = id only. Streamers edit VOD/live titles mid-broadcast,
+    # and a title-based %(title)s template silently strands .part files on
+    # re-runs (new name -> yt-dlp starts over instead of resuming).
+    outtmpl = str(Path(ns.output) / "%(id)s.%(ext)s")
 
     args = ["-f", sel, "-o", outtmpl, "--merge-output-format", "mp4",
-            "--no-playlist", "--embed-metadata", "--progress", "--newline", url]
+            "--no-playlist", "--embed-metadata", "--progress", "--newline",
+            "--concurrent-fragments", "8", url]
 
     if ns.sub:
         i = args.index("-f")
