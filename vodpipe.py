@@ -470,6 +470,14 @@ def main():
                 job.set(tag, "done", secs=round(time.time() - t0))
             job.set(name, "done", secs=None)
             print(f"[vodpipe] ✓ {name}")
+        try:  # VOD chat + metadata — network-bound, non-fatal (skips on clips/local/offline)
+            import twitch_chat
+            twitch_chat.run(job.dir)
+        except SystemExit as e:
+            if e.code != 3:
+                print(f"[vodpipe] chat stage skipped (exit {e.code})")
+        except Exception as e:
+            print(f"[vodpipe] chat skipped: {str(e)[:100]}")
         try:  # cheap (<1 s), non-fatal: per-person voice profiles for the UI
             import voice_stats
             voice_stats.run(job.dir, force=True)

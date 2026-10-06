@@ -10,3 +10,4 @@ uvicorn>=0.29
 # CUDA runtime DLLs for CTranslate2 on Windows (pip wheels, not drivers):
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
+twitch-dl>=0.2.14

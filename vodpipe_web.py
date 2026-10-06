@@ -136,7 +136,14 @@ def api_job(jid: str):
     d = job_dir(jid)
     st = json.loads((d / "state.json").read_text(encoding="utf-8"))
     st["_artifacts"] = {n: (d / n).exists() for n in
-                        ("labeled.txt", "people.json", "scan_flirting.txt")}
+                        ("labeled.txt", "people.json", "scan_flirting.txt",
+                         "chat.json", "voice_stats.json")}
+    meta_p = d / "meta.json"
+    if meta_p.exists():
+        try:
+            st["_meta"] = json.loads(meta_p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     # live download size while the mp4 is still a .part (largest wins —
     # stale parts from earlier runs can coexist)
     parts = list(d.glob("*.part"))
@@ -173,8 +180,13 @@ def api_voices(jid: str):
         return {}
     try:
         st = json.loads((d / "state.json").read_text(encoding="utf-8"))
-        if any(v.get("status") != "done" for v in st.get("stages", {}).values()):
-            return {}     # still running; retry after JOB COMPLETE
+        vals = list(st.get("stages", {}).values())
+        running = any(v.get("status") == "running" for v in vals)
+        settled = bool(vals) and not running
+        # profile once the job has settled — whether it finished cleanly,
+        # was cancelled, or skipped identity stages on a tiny source
+        if not settled or not any(v.get("status") == "done" for v in vals):
+            return {}
     except Exception:
         return {}
     try:
@@ -214,6 +226,31 @@ def hms_to_s(h, m, s):
 def api_scan(jid: str):
     p = job_dir(jid) / "scan_flirting.txt"
     return {"text": p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""}
+
+
+@app.get("/api/job/{jid}/chat")
+def api_chat(jid: str, q: str = "", user: str = "", around: float = -1,
+             window: float = 120, limit: int = 300):
+    """VOD chat replay, optionally filtered by keyword / chatter / time window.
+    `around` (seconds) + window returns chat around that moment; used by the
+    transcript 'chat here' buttons."""
+    p = job_dir(jid) / "chat.json"
+    if not p.exists():
+        return {"lines": [], "total": 0}
+    msgs = json.loads(p.read_text(encoding="utf-8"))
+    ql = q.lower()
+    out = []
+    for m in msgs:
+        if around >= 0 and abs(m["t"] - around) > window:
+            continue
+        if user and m["user"].lower() != user.lower():
+            continue
+        if ql and ql not in m["text"].lower():
+            continue
+        out.append(m)
+        if len(out) >= limit:
+            break
+    return {"lines": out, "total": len(msgs)}
 
 
 @app.get("/media/{jid}/{name}")
@@ -265,7 +302,7 @@ const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[
 const hms=t=>{t|=0;return String(t/3600|0).padStart(2,0)+':'+String(t%3600/60|0).padStart(2,0)+':'+String(t%60).padStart(2,0)};
 const STAGES=['download','audio','transcribe','diarize','voiceprint','label','solos','reasr','clean','scan'];
 async function j(u,o){return (await fetch(u,o)).json()}
-let _jobId=null,_people=[],_lane=null,_timer=null,_voice={},_peopleKey=null,_voiceDone=false,_lanes=[];
+let _jobId=null,_people=[],_lane=null,_timer=null,_voice={},_peopleKey=null,_voiceDone=false,_lanes=[],_meta=null,_hasChat=false;
 function talkBar(sec,max){const w=Math.max(2,Math.min(100,sec/(max||1)*100));
  return `<span style="display:inline-block;height:5px;width:${w}%;max-width:120px;background:var(--accent,#5b5bd6);border-radius:3px;vertical-align:middle"></span>`}
 function personRow(nm,p,maxTalk){
@@ -274,8 +311,8 @@ function personRow(nm,p,maxTalk){
  return `<tr${frag?' style="opacity:.55"':''}>
   <td class=lane>${esc(nm)}${p.joined_late?' <span style=font-size:10px>late</span>':''}</td>
   <td style="white-space:nowrap">${hms(p.talk_seconds)} · ${p.n_segments}s ${talkBar(p.talk_seconds,maxTalk)}</td>
-  <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)">${esc(v.desc||'profile pending…')}</td>
-  <td>${solo>=0?'<span class="st done">solo</span>':''}</td>
+  <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)">${esc(v.desc||(frag?'fragment — too brief to profile':'profile pending…'))}</td>
+  <td>${solo>=0?'<span class="st done" title="solo voice clip ready">✓ clip</span>':'<span style="opacity:.35" title="no solo track (lane below threshold)">—</span>'}</td>
   <td><button onclick="openLane('${esc(nm)}')">open</button></td></tr>`}
 function renderPeople(){
  const box=$('#peoplebox');if(!box||_lane)return;   // never clobber an open lane
@@ -355,11 +392,11 @@ async function tick(){
 /* ---------------- live job view ---------------- */
 function stopTimer(){if(_timer){clearTimeout(_timer);_timer=null}}
 async function openJob(id){
- stopTimer();_jobId=id;_lane=null;
+ stopTimer();_jobId=id;_lane=null;_meta=null;_hasChat=false;
  $('#app').innerHTML=`<span class=back onclick="location.hash='';jobsView()">← jobs</span>
-  <h1 id=jtitle>${id}</h1><div id=prog></div><div id=logbox></div>
+  <h1 id=jtitle>${id}</h1><div id=metabox></div><div id=prog></div><div id=logbox></div>
   <div id=peoplebox></div><div id=lanebox></div>
-  <div id=searchbox></div><div id=scanbox></div>`;
+  <div id=searchbox></div><div id=chatbox></div><div id=scanbox></div>`;
  jobTick();
 }
 async function jobTick(){
@@ -409,6 +446,14 @@ async function jobTick(){
 
  /* artifacts appear as stages land */
  const art=J._artifacts||{};
+ if(J._meta&&J._meta!==_meta){_meta=J._meta;
+  $('#metabox').innerHTML=`<div style="font-size:13px;color:var(--muted-foreground);margin:-6px 0 10px">
+   <b style="color:var(--foreground)">${esc(_meta.title||_jobId)}</b><br>
+   ${['streamer','game','date','duration_s','view_count'].filter(k=>_meta[k]).map(k=>
+    k==='duration_s'?`length ${hms(_meta[k])}`:
+    k==='date'?`${String(_meta.date).slice(0,10)}`:
+    k==='view_count'?`${_meta[k]} views`:`${k} ${esc(_meta[k])}`).join(' · ')}
+   ${_meta.url?` · <a href="${esc(_meta.url)}" style="color:var(--accent,#8b8bff)" target=_blank>twitch ↗</a>`:''}</div>`;}
  if(art['people.json']){
   const settled=!running;                    // stable after pipeline settles
   if(_peopleKey!==_jobId){
@@ -429,6 +474,11 @@ async function jobTick(){
  if(art['labeled.txt']){const sel=$('#laneF');
   if(sel.options.length===1){const P=_people.filter(([,p])=>p.n_segments>=5).map(x=>x[0]);
    sel.innerHTML='<option>ALL</option>'+P.map(x=>`<option>${esc(x)}</option>`).join('');}}
+ if(art['chat.json']){_hasChat=true;
+  if(!$('#chatbox').innerHTML)$('#chatbox').innerHTML=
+   `<h2>Chat replay</h2><div style="display:flex;gap:8px;flex-wrap:wrap">
+    <input id=cq placeholder="chat keyword…" style="flex:1;min-width:160px" onkeydown="if(event.key==='Enter')doChat()">
+    <button onclick=doChat()>Search chat</button></div><table id=chathits></table>`;}
  if(art['scan_flirting.txt']&&!$('#scanbox').innerHTML){const S=await j(`/api/job/${_jobId}/scan`);
   $('#scanbox').innerHTML=`<h2>Scans</h2><details><summary>register scan (flirting etc.)</summary><pre>${esc(S.text)}</pre></details>`;}
  _timer=setTimeout(jobTick,n===STAGES.length?15000:2500);
@@ -460,8 +510,22 @@ async function cancelJob(){
 async function doSearch(){
  const q=$('#q').value.trim(),lane=$('#laneF').value;
  const r=await j(`/api/job/${_jobId}/transcript?q=${encodeURIComponent(q)}&lane=${encodeURIComponent(lane)}&limit=400`);
- $('#hits').innerHTML=r.lines.map(l=>`<tr><td class=t>${hms(l.t)}</td><td class=lane>${esc(l.label)}</td><td>${esc(l.text)}</td></tr>`).join('')||'<tr><td>no hits</td></tr>';
+ $('#hits').innerHTML=r.lines.map(l=>`<tr><td class=t>${hms(l.t)}</td><td class=lane>${esc(l.label)}</td><td>${esc(l.text)}</td>
+  ${_hasChat?`<td><a class=t onclick="showChat(${l.t})">💬</a></td>`:''}</tr>`).join('')||'<tr><td>no hits</td></tr>';
 }
+async function doChat(){
+ const q=$('#cq').value.trim();
+ const r=await j(`/api/job/${_jobId}/chat?q=${encodeURIComponent(q)}&limit=300`);
+ $('#chathits').innerHTML=`<tr><td colspan=3 style=opacity:.6>${r.total} chat messages total, showing ${r.lines.length}</td></tr>`+
+  r.lines.map(m=>`<tr><td class=t>${hms(m.t)}</td><td class=lane>${esc(m.user)}</td><td>${esc(m.text)}</td></tr>`).join('')||'<tr><td>no chat hits</td></tr>';
+}
+async function showChat(t){
+ const r=await j(`/api/job/${_jobId}/chat?around=${t}&window=45&limit=60`);
+ $('#chatbox').innerHTML=`<h2>Chat around ${hms(t)} <span style="font-weight:400;font-size:12px">±45 s — <a class=t onclick=closeChat()>clear</a></span></h2>
+  <table>${r.lines.map(m=>`<tr><td class=t>${hms(m.t)}</td><td class=lane>${esc(m.user)}</td><td>${esc(m.text)}</td></tr>`).join('')||'<tr><td>silent chat then</td></tr>'}</table>`;
+ $('#chatbox').scrollIntoView({behavior:'smooth'});
+}
+function closeChat(){$('#chatbox').innerHTML='';}
 function route(){const h=location.hash.slice(1);h.startsWith('job/')?openJob(h.slice(4)):jobsView()}
 window.onhashchange=route;
 route();

@@ -80,7 +80,7 @@ def main():
         if not live:
             print("[twitch_dl] channel is offline — nothing to record")
             sys.exit(3)
-        liveargs = ["-f", sel, "-o", outtmpl, "--no-playlist",
+        liveargs = ["-f", sel, "-o", outtmpl, "--no-playlist", "--write-info-json",
                     "--progress", "--newline",
                     "--stream-retry", "20", "--sleep-requests", "1", url]
         if ns.browser:
@@ -89,7 +89,8 @@ def main():
         sys.exit(run_ytdlp(liveargs).returncode)
 
     args = ["-f", sel, "-o", outtmpl, "--merge-output-format", "mp4",
-            "--no-playlist", "--embed-metadata", "--progress", "--newline",
+            "--no-playlist", "--embed-metadata", "--write-info-json",
+            "--progress", "--newline",
             "--concurrent-fragments", "8", url]
 
     if ns.sub:
