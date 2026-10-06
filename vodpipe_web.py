@@ -365,6 +365,7 @@ async function openJob(id){
 async function jobTick(){
  if(_jobId===null||!$('#prog'))return;
  const J=await j('/api/job/'+_jobId);
+ _lanes=J.lanes||_lanes;
  const st=J.stages||{};
  let n=0,act=null;
  for(const s of STAGES){const v=st[s];
