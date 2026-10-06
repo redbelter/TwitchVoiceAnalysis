@@ -20,6 +20,7 @@ Notes:
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -27,7 +28,7 @@ import sys
 from pathlib import Path
 
 VALID_URL_RE = re.compile(
-    r"(twitch\.tv/(videos/\d+|clip/[\w-]+|p/\w+|\w+)(\?.*)?$)", re.I
+    r"(twitch\.tv/(videos/\d+|clip/[\w-]+|[\w-]+/clip/[\w-]+|p/\w+|\w+)(\?.*)?$)", re.I
 )
 
 def run_ytdlp(args):
@@ -44,6 +45,9 @@ def main():
     ap.add_argument("--start", default=None, help="Trim start (HH:MM:SS or seconds)")
     ap.add_argument("--end", default=None, help="Trim end   (HH:MM:SS or seconds)")
     ap.add_argument("--list", action="store_true", help="List formats and exit")
+    ap.add_argument("--live", action="store_true",
+                    help="Record a live stream: keeps up with the broadcast, "
+                         "retries stream drops. Exit 3 if channel is offline.")
     ap.add_argument("--sub", action="store_true", help="Sub-only: video+audio, skip other assets")
     ap.add_argument("--browser", default=None, choices=["chrome", "firefox", "edge"],
                     help="Use browser cookies (needed for subscriber-only VODs)")
@@ -63,6 +67,26 @@ def main():
     # and a title-based %(title)s template silently strands .part files on
     # re-runs (new name -> yt-dlp starts over instead of resuming).
     outtmpl = str(Path(ns.output) / "%(id)s.%(ext)s")
+
+    if ns.live:
+        # Recording mode: refuse politely if offline (exit 3 = "nothing to do",
+        # not an error — queue mode uses this to skip and retry later).
+        r = subprocess.run([sys.executable, "-m", "yt_dlp", "-J", "--skip-download", url],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        try:
+            live = json.loads(r.stdout).get("is_live")
+        except Exception:
+            live = None
+        if not live:
+            print("[twitch_dl] channel is offline — nothing to record")
+            sys.exit(3)
+        liveargs = ["-f", sel, "-o", outtmpl, "--no-playlist",
+                    "--progress", "--newline",
+                    "--stream-retry", "20", "--sleep-requests", "1", url]
+        if ns.browser:
+            liveargs = ["--cookies-from-browser", ns.browser] + liveargs
+        print(f"[twitch_dl] RECORDING LIVE {url} -> {ns.output} (runs at realtime)")
+        sys.exit(run_ytdlp(liveargs).returncode)
 
     args = ["-f", sel, "-o", outtmpl, "--merge-output-format", "mp4",
             "--no-playlist", "--embed-metadata", "--progress", "--newline",

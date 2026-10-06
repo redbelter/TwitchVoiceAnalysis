@@ -82,6 +82,55 @@ def api_cancel(jid: str):
     return vp.cancel_job(WORKDIR, jid)
 
 
+@app.get("/api/queues")
+def api_queues():
+    out = []
+    for p in sorted(WORKDIR.glob("queue_*.json")):
+        try:
+            q = json.loads(p.read_text(encoding="utf-8"))
+            q["counts"] = {s: sum(1 for it in q["items"] if it["status"] == s)
+                           for s in ("pending", "running", "done", "cached",
+                                     "offline", "failed", "partial")}
+            out.append(q)
+        except Exception:
+            pass
+    return out
+
+
+@app.post("/api/queue")
+async def api_queue(payload: dict):
+    login = (payload.get("login") or "").strip()
+    if not login:
+        raise HTTPException(400, "need login")
+    cmd = [sys.executable, str(HERE / "vodpipe_queue.py"), login,
+           "--workdir", str(WORKDIR)]
+    if payload.get("clips"):
+        cmd.append("--clips")
+    if payload.get("max_gb"):
+        cmd += ["--max-gb", str(payload["max_gb"])]
+    log = open(WORKDIR / f"queue_{login.lower()}.log", "a", encoding="utf-8")
+    p = subprocess.Popen(cmd, stdout=log, stderr=log)
+    return {"queue": login, "started_pid": p.pid}
+
+
+@app.post("/api/queue/{login}/cancel")
+def api_queue_cancel(login: str):
+    """Kill the queue runner; /T takes its vodpipe child tree with it."""
+    out = subprocess.run(["wmic", "process", "where", "name like '%python%'",
+                          "get", "processid,commandline"],
+                         capture_output=True, text=True).stdout
+    killed = []
+    for ln in out.splitlines():
+        if f"vodpipe_queue.py {login}" in ln or f"vodpipe_queue.py \"{login}\"" in ln:
+            m = re.search(r"(\d+)\s*$", ln.strip())
+            if m:
+                r = subprocess.run(["taskkill", "/PID", m.group(1), "/T", "/F"],
+                                   capture_output=True, text=True)
+                if r.returncode == 0:
+                    killed.append(int(m.group(1)))
+    return {"killed": killed}
+
+
 @app.get("/api/job/{jid}")
 def api_job(jid: str):
     d = job_dir(jid)
@@ -169,6 +218,8 @@ button{cursor:pointer;background:var(--accent,#5b5bd6);border-color:transparent}
  border:1px solid var(--border,#2c2c34)}
 .done{color:#7ee08a;border-color:#2f5e39}.failed{color:#ff7b72;border-color:#6e2b2b}
 .running{color:#f0c674;border-color:#6e5b2b}
+.pending{opacity:.55}.cached{color:#7ee08a;border-color:#2f5e39;opacity:.7}
+.offline,.waiting{color:#9a9aa2;border-style:dashed}.partial{color:#f0c674}
 table{border-collapse:collapse;width:100%;font-size:13px}
 td{padding:3px 8px;border-bottom:1px solid var(--border,#222);vertical-align:top}
 td.t{white-space:nowrap;color:var(--muted-foreground,#9a9aa2)}
@@ -200,8 +251,39 @@ function jobsView(){
  <input id=url placeholder="twitch url or local video path" style="flex:1;min-width:260px">
  <input id=seed placeholder="--seed TS=Name (optional)" style="width:200px">
  <button onclick=start()>Start job</button></div>
+ <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+ <input id=login placeholder="channel login — queues live + every VOD" style="flex:1;min-width:260px">
+ <input id=maxgb type=number value=100 title="max disk GB" style="width:90px">
+ <label style="font-size:12px;align-self:center"><input type=checkbox id=qclips> clips</label>
+ <button onclick=startQueue()>Queue channel</button></div>
+ <div id=queues></div>
  <h2>Jobs</h2><div id=jobs></div>`;
  tick();
+}
+async function startQueue(){
+ const login=$('#login').value.trim();if(!login)return;
+ await j('/api/queue',{method:'POST',headers:{'content-type':'application/json'},
+   body:JSON.stringify({login,max_gb:+$('#maxgb').value||100,clips:$('#qclips').checked})});
+ $('#login').value='';setTimeout(tick,1500);
+}
+async function cancelQueue(l){
+ if(!confirm('Stop queue for '+l+'? Parts already downloaded stay on disk.'))return;
+ await j('/api/queue/'+l+'/cancel',{method:'POST'});setTimeout(tick,800);
+}
+async function tickQueues(){
+ const box=$('#queues');if(!box)return;
+ const qs=await j('/api/queues');
+ box.innerHTML=qs.length?'<h2>Channel queues</h2>'+qs.map(q=>{
+  const c=q.counts||{};const tot=q.items.length;
+  const fin=(c.done||0)+(c.cached||0)+(c.offline||0)+(c.failed||0);
+  const items=q.items.slice(0,12).map(it=>
+   '<span class="st '+it.status+'"><a href="#job/'+it.id+'" style="color:inherit;text-decoration:none">'+it.id+'</a></span>').join('');
+  const more=tot>12?'<span style="opacity:.5;font-size:11px"> +'+(tot-12)+' more</span>':'';
+  const trimmed=q.dropped_gb?', trimmed '+q.dropped_gb+' GB (disk budget)':'';
+  const stop=c.running?'<button onclick="cancelQueue('+JSON.stringify(q.login)+')" style="margin-left:8px;padding:2px 10px;font-size:11px">stop queue</button>':'';
+  return '<div class=job><b>'+q.login+'</b> '+fin+'/'+tot+
+   ' <span style="opacity:.6;font-size:12px">cap '+q.cap_gb+' GB'+trimmed+'</span>'+stop+
+   '<div style="margin-top:4px">'+items+more+'</div></div>'}).join(''):'';
 }
 async function start(){
  const url=$('#url').value.trim();if(!url)return;
@@ -211,6 +293,7 @@ async function start(){
 }
 async function tick(){
  if(!$('#jobs'))return;
+ tickQueues();
  const jobs=await j('/api/jobs');
  $('#jobs').innerHTML=jobs.map(J=>{
   const st=J.stages||{};let n=0;

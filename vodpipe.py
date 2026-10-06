@@ -53,6 +53,9 @@ def job_id_for(s):
     m = re.search(r"clips\.twitch\.tv/([\w-]+)|twitch\.tv/\w+/clip/([\w-]+)", s)
     if m:
         return "c" + (m.group(1) or m.group(2))[:24].replace("-", "_")
+    m = re.search(r"twitch\.tv/([A-Za-z0-9_]+)/?$", s)   # channel root -> live job
+    if m and m.group(1).lower() not in ("videos", "p", "clip", "clips", "directory"):
+        return "L" + m.group(1).lower()
     # local files: same file must hash the same however it was typed/dropped
     s = str(Path(s).resolve()).lower().replace("/", "\\")
     return "f" + hashlib.sha1(s.encode()).hexdigest()[:12]
@@ -199,10 +202,23 @@ def cancel_job(workdir: Path, jid: str):
     return {"killed_pids": killed, "cancelled_stages": changed}
 
 
+def rttm_speech_secs(job):
+    p = job.dir / "rttm.json"
+    if not p.exists():
+        return None
+    try:
+        return sum(r[1] - r[0] for r in json.loads(p.read_text(encoding="utf-8")))
+    except Exception:
+        return None
+
+
 def rttm_covers(job):
     p = job.dir / "rttm.json"
     if not p.exists() or not job.st.get("duration"):
         return False
+    secs = rttm_speech_secs(job)
+    if secs is not None and secs < 60:
+        return True   # near-silent source: nothing to cover (not a truncation)
     try:
         regs = json.loads(p.read_text(encoding="utf-8"))
         return bool(regs) and max(r[1] for r in regs) >= job.st["duration"] - 60
@@ -219,14 +235,25 @@ def stage_plan(job, name):
     def J(p):
         return p.exists() and p.stat().st_size > 0
 
+    # Sub-minute sources AND near-silent sources (game-only VODs, music
+    # streams) carry no usable voice-identity signal — TitaNet crashes on
+    # empty segment sets. Deliver download + audio + transcript only.
+    dur = job.st.get("duration")
+    speech = rttm_speech_secs(job) if name != "diarize" else None
+    if name in ("voiceprint", "label", "solos", "reasr", "clean", "scan") and (
+            (dur is not None and dur < 60) or (speech is not None and speech < 60)):
+        return []
+
     if name == "download":
         if not job.st.get("url"):
             return []
         if next(d.glob("*.mp4"), None):
             return [("download", None, lambda: True)]
-        return [("download",
-                 [py, HERE / "twitch_dl.py", job.st["url"], "-o", d,
-                  "-f", job.st.get("height", 720)],
+        cmd = [py, HERE / "twitch_dl.py", job.st["url"], "-o", d,
+               "-f", job.st.get("height", 720)]
+        if job.st.get("live"):
+            cmd.append("--live")
+        return [("download", cmd,
                  lambda: next(d.glob("*.mp4"), None) is not None)]
     if name == "audio":
         src = job.source()
@@ -289,19 +316,30 @@ def stage_plan(job, name):
     raise ValueError(name)
 
 
-def acquire_lock(workdir: Path, jid: str):
+def acquire_lock(workdir: Path, jid: str, wait=False):
     lk = workdir / "gpu.lock"
-    if lk.exists():
+
+    def holder():
+        if not lk.exists():
+            return None
         try:
             pid = int(lk.read_text(encoding="utf-8").split()[0])
-            if pid != os.getpid():
-                out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
-                                     capture_output=True, text=True).stdout
-                if str(pid) in out:
-                    sys.exit(f"[vodpipe] GPU busy — another vodpipe holds the lock "
-                             f"(pid {pid}): {lk.read_text(encoding='utf-8')}")
-        except (ValueError, FileNotFoundError, IndexError):
-            pass
+        except (ValueError, IndexError):
+            return None
+        if pid == os.getpid():
+            return None
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                             capture_output=True, text=True).stdout
+        return pid if str(pid) in out else None
+
+    pid = holder()
+    if pid and wait:
+        while pid:
+            time.sleep(20)
+            pid = holder()
+    elif pid:
+        sys.exit(f"[vodpipe] GPU busy — another vodpipe holds the lock "
+                 f"(pid {pid}): {lk.read_text(encoding='utf-8')}")
     lk.write_text(f"{os.getpid()} {jid}", encoding="utf-8")
     return lk
 
@@ -323,6 +361,12 @@ def main():
     ap.add_argument("--jobs", action="store_true")
     ap.add_argument("--status", metavar="JOB")
     ap.add_argument("--cancel", metavar="JOB")
+    ap.add_argument("--live", action="store_true",
+                    help="record a live channel (channel-root url); realtime pace")
+    ap.add_argument("--clips", action="store_true",
+                    help="with a bare channel login: also queue clips (small)")
+    ap.add_argument("--wait-lock", action="store_true",
+                    help="queue mode: wait politely for the GPU lock instead of failing")
     ap.add_argument("--stage", nargs=2, metavar=("NAME", "JOB"))
     ns = ap.parse_args()
     workdir = Path(ns.workdir)
@@ -342,15 +386,32 @@ def main():
         print(json.dumps(Job(workdir, ns.status).st, indent=1))
         return
     if not ns.target:
-        ap.error("need a twitch url or video file (or --jobs/--status)")
+        ap.error("need a twitch url, video file, or channel login (or --jobs/--status/--cancel)")
+
+    # bare channel login ("some_streamer" / twitch.tv/some_streamer):
+    # queue EVERYTHING downloadable — live (if up) + all VODs + clips on request
+    if re.fullmatch(r"[A-Za-z0-9_]{3,25}", ns.target or "") and ":" not in ns.target:
+        import twitch_profile as _tp
+        if _tp.channel_login(ns.target):
+            print(f"[vodpipe] '{ns.target}' is a channel login — queueing everything "
+                  f"downloadable (live + VODs; add --clips for clips).")
+            qcmd = [sys.executable, str(HERE / "vodpipe_queue.py"), ns.target,
+                    "--workdir", str(workdir), "--height", str(ns.height)]
+            if ns.clips:
+                qcmd.append("--clips")
+            sys.exit(subprocess.call(qcmd))
 
     is_url = ns.target.startswith("http") or "twitch.tv" in ns.target
     jid = job_id_for(ns.target)
+    live = ns.live or jid.startswith("L")
     job = Job(workdir, jid, create=True,
               **({"url": ns.target} if is_url else {"input": str(Path(ns.target).resolve())}))
-    job.st.update(diar_py=ns.diar_python, height=ns.height, lang=ns.lang,
+    # never clobber a saved diar_py with an empty default (re-runs often lack
+    # the env var; the job already knows what worked)
+    job.st.update(diar_py=ns.diar_python or job.st.get("diar_py") or DEFAULT_DIAR,
+                  height=ns.height, lang=ns.lang,
                   streamer=ns.streamer, seed=ns.seed, seeds=ns.seed,
-                  min_segs=ns.min_segs)
+                  min_segs=ns.min_segs, live=live)
     job.save()
 
     if not is_url and not Path(job.st["input"]).exists():
@@ -366,7 +427,7 @@ def main():
             job.set(tag, "done" if rc == 0 else "failed", rc=rc)
         return
 
-    lk = acquire_lock(workdir, jid)
+    lk = acquire_lock(workdir, jid, wait=ns.wait_lock)
     try:
         job.st["cancelled"] = False
         job.st["runner_pid"] = os.getpid()
@@ -390,6 +451,11 @@ def main():
                 t0 = time.time()
                 job.set(tag, "running", started=t0, prog={})
                 rc = run(cmd, job.dir / "logs" / f"{name}.log", tag, job)
+                if rc == 3 and job.st.get("live"):
+                    # channel offline — not a failure; queue retries later
+                    job.set(tag, "waiting", rc=3, note="channel offline")
+                    print("[vodpipe] channel offline — nothing recorded (exit clean)")
+                    return
                 if rc != 0:
                     job.set(tag, "failed", rc=rc)
                     sys.exit(f"[vodpipe] {tag} failed (rc {rc}) — "

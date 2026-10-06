@@ -10,7 +10,9 @@ set "TARGET=%~1"
 goto run
 
 :ask
-set /p TARGET=Paste a Twitch URL (or drag a video file onto this .bat instead): 
+echo   - paste a Twitch VOD/clip URL
+echo   - or type a channel login to queue EVERYTHING (live + all VODs)
+set /p TARGET=Twitch URL or channel login (or drag a video file onto this .bat): 
 if "%TARGET%"=="" exit /b 1
 
 :run

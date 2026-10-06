@@ -33,6 +33,29 @@ set "VODPIPE_DIAR_PY=C:\path\to\venvs\diar\Scripts\python.exe"
 ```
 Create it once next to the .bat files; everything picks it up.
 
+### Channel profile mode — queue everything
+
+Give it just a login and it pulls **everything downloadable**: the live
+stream if it's up, plus every VOD (clips optional) — queued one-by-one on the
+GPU lock, disk-budgeted (`--max-gb`, default 100, always keeps 20 GB free).
+
+```
+python vodpipe.py some_streamer            # queue whole channel, newest-first
+python vodpipe.py some_streamer --clips    # + clips (small, cheap)
+python vodpipe_queue.py some_streamer --max-gb 200 --vod-limit 10
+```
+
+Or on the dashboard: the **Queue channel** box. Per-item status
+(pending / running / done / cached / offline / failed) renders under *Channel
+queues*; every item is a normal job you can open, watch live, or cancel.
+
+- **Live stream**: recording runs at realtime pace while on air (Twitch DVR
+  is a sliding window — that's physics, not a bug). Channel offline → item
+  marked `offline`, queue moves on; re-run later to catch the stream.
+- Re-running a queue picks up **only new VODs** (completed items skip).
+- Near-silent / sub-minute sources skip the identity stages and still deliver
+  a transcript — voiceprints need real speech.
+
 ### CLI
 
 ```bash
