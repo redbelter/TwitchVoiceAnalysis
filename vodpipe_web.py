@@ -160,6 +160,30 @@ def api_people(jid: str):
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
 
 
+@app.get("/api/job/{jid}/voices")
+def api_voices(jid: str):
+    """Per-person voice profile (pitch/tempo/style + one-line description).
+    Computed lazily and cached in the job dir as voice_stats.json — but only
+    once the pipeline has settled, so we never profile half-written solo wavs."""
+    d = job_dir(jid)
+    cached = d / "voice_stats.json"
+    if cached.exists():
+        return json.loads(cached.read_text(encoding="utf-8"))
+    if not (d / "people.json").exists():
+        return {}
+    try:
+        st = json.loads((d / "state.json").read_text(encoding="utf-8"))
+        if any(v.get("status") != "done" for v in st.get("stages", {}).values()):
+            return {}     # still running; retry after JOB COMPLETE
+    except Exception:
+        return {}
+    try:
+        import voice_stats
+        return voice_stats.run(d)
+    except Exception as e:
+        raise HTTPException(500, f"voice stats failed: {str(e)[:200]}")
+
+
 @app.get("/api/job/{jid}/transcript")
 def api_transcript(jid: str, q: str = "", lane: str = "", limit: int = 400):
     src = job_dir(jid) / "labeled.txt"
@@ -241,7 +265,29 @@ const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[
 const hms=t=>{t|=0;return String(t/3600|0).padStart(2,0)+':'+String(t%3600/60|0).padStart(2,0)+':'+String(t%60).padStart(2,0)};
 const STAGES=['download','audio','transcribe','diarize','voiceprint','label','solos','reasr','clean','scan'];
 async function j(u,o){return (await fetch(u,o)).json()}
-let _jobId=null,_people=[],_lane=null,_timer=null;
+let _jobId=null,_people=[],_lane=null,_timer=null,_voice={},_peopleKey=null,_voiceDone=false,_lanes=[];
+function talkBar(sec,max){const w=Math.max(2,Math.min(100,sec/(max||1)*100));
+ return `<span style="display:inline-block;height:5px;width:${w}%;max-width:120px;background:var(--accent,#5b5bd6);border-radius:3px;vertical-align:middle"></span>`}
+function personRow(nm,p,maxTalk){
+ const v=_voice[nm]||{},solo=_lanes.indexOf(nm);
+ const frag=p.n_segments<5;
+ return `<tr${frag?' style="opacity:.55"':''}>
+  <td class=lane>${esc(nm)}${p.joined_late?' <span style=font-size:10px>late</span>':''}</td>
+  <td style="white-space:nowrap">${hms(p.talk_seconds)} · ${p.n_segments}s ${talkBar(p.talk_seconds,maxTalk)}</td>
+  <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)">${esc(v.desc||'profile pending…')}</td>
+  <td>${solo>=0?'<span class="st done">solo</span>':''}</td>
+  <td><button onclick="openLane('${esc(nm)}')">open</button></td></tr>`}
+function renderPeople(){
+ const box=$('#peoplebox');if(!box||_lane)return;   // never clobber an open lane
+ const majors=_people.filter(([,p])=>p.n_segments>=5);
+ const frags=_people.filter(([,p])=>p.n_segments<5);
+ const maxT=Math.max(1,...majors.map(([,p])=>p.talk_seconds||0));
+ box.innerHTML=`<h2>People <span style="font-weight:400;font-size:12px;color:var(--muted-foreground)">${majors.length} speakers · ${frags.length} fragments</span></h2>
+  <table>${majors.map(([nm,p])=>personRow(nm,p,maxT)).join('')}</table>
+  ${frags.length?`<details style="margin-top:6px"><summary>show ${frags.length} fragment lanes (1-4 utterances: brief/crosstalk voices, no solo tracks)</summary>
+   <table>${frags.map(([nm,p])=>personRow(nm,p,0)).join('')}</table></details>`:''}
+  <div id=laneBox2></div>`;
+}
 
 /* ---------------- jobs list ---------------- */
 function jobsView(){
@@ -362,21 +408,25 @@ async function jobTick(){
 
  /* artifacts appear as stages land */
  const art=J._artifacts||{};
- if(art['people.json']){const P=await j(`/api/job/${_jobId}/people`);
-  _people=Object.entries(P).sort((a,b)=>b[1].talk_seconds-a[1].talk_seconds);
-  $('#peoplebox').innerHTML=`<h2>People</h2><table>${_people.map(([nm,p],i)=>`<tr>
-   <td class=lane>${esc(nm)}</td>
-   <td>${hms(p.talk_seconds)} talk · ${p.n_segments} segs${p.joined_late?' · joined late':''}</td>
-   <td><button onclick=openLane('${esc(nm)}')>open</button></td></tr>`).join('')}</table><div id=laneBox2></div>`;
-  if(_lane)openLane(_lane,true);}
+ if(art['people.json']){
+  const settled=!running;                    // stable after pipeline settles
+  if(_peopleKey!==_jobId){
+   const P=await j(`/api/job/${_jobId}/people`);
+   _people=Object.entries(P).sort((a,b)=>b[1].talk_seconds-a[1].talk_seconds);
+   try{_voice=await j(`/api/job/${_jobId}/voices`);}catch(e){_voice={};}
+   _peopleKey=_jobId; renderPeople();
+  } else if(settled&&!_voiceDone){
+   try{const v=await j(`/api/job/${_jobId}/voices`);
+    if(Object.keys(v).length){_voice=v;_voiceDone=true;renderPeople();if(_lane)openLane(_lane);}}catch(e){}
+  }
+ }
  $('#searchbox').innerHTML=$('#searchbox').innerHTML||
   `<h2>Transcript</h2><div style="display:flex;gap:8px;flex-wrap:wrap">
    <input id=q placeholder="keyword…" style="flex:1;min-width:160px" onkeydown="if(event.key==='Enter')doSearch()">
    <select id=laneF><option>ALL</option></select>
    <button onclick=doSearch()>Search</button></div><table id=hits></table>`;
  if(art['labeled.txt']){const sel=$('#laneF');
-  if(sel.options.length===1){const P=_people.length?_people.map(x=>x[0])
-   :await j(`/api/job/${_jobId}/people`).then(p=>Object.keys(p));
+  if(sel.options.length===1){const P=_people.filter(([,p])=>p.n_segments>=5).map(x=>x[0]);
    sel.innerHTML='<option>ALL</option>'+P.map(x=>`<option>${esc(x)}</option>`).join('');}}
  if(art['scan_flirting.txt']&&!$('#scanbox').innerHTML){const S=await j(`/api/job/${_jobId}/scan`);
   $('#scanbox').innerHTML=`<h2>Scans</h2><details><summary>register scan (flirting etc.)</summary><pre>${esc(S.text)}</pre></details>`;}
@@ -385,16 +435,22 @@ async function jobTick(){
 
 async function openLane(nm,keep){
  _lane=nm;const J=await j('/api/job/'+_jobId);
- const i=(J.lanes||[]).findIndex(l=>l===nm);
- let html=`<h2>${esc(nm)}</h2>`;
- if(i>=0)html+=`<audio controls preload=none src="/media/${_jobId}/solo_${i}_solo.wav"></audio>`;
- else html+='<i style="opacity:.6">no solo track (lane below threshold)</i>';
+ _lanes=J.lanes||[];
+ const i=_lanes.indexOf(nm);
+ const v=_voice[nm]||{};
+ let html=`<span class=back onclick=closeLane()>← all people</span>
+  <h2>${esc(nm)} <span style="font-weight:400;font-size:12px;color:var(--muted-foreground)">(${hms(v.talk_seconds||0)} talk · ${v.segs||'?'} segs${v.joined_late?' · joined late':''})</span></h2>`;
+ if(v.desc)html+=`<div style="font-size:13px;color:var(--accent,#8b8bff);margin:2px 0 8px">${esc(v.desc)}</div>`;
+ if(i>=0)html+=`<audio controls preload=metadata src="/media/${_jobId}/solo_${i}_solo.wav"></audio>
+   <div style="font-size:11px;color:var(--muted-foreground)">solo track — only ${esc(nm)}'s segments, stitched; timestamps stay in original VOD time via "clean" tab below</div>`;
+ else html+='<i style="opacity:.6">no solo track (lane below solo threshold)</i>';
  html+=`<table id=laneHits></table>`;
  const box=$('#laneBox2')||$('#lanebox');if(!box)return;
  box.innerHTML=html;
  const t=await j(`/api/job/${_jobId}/transcript?lane=${encodeURIComponent(nm)}&limit=500`);
  $('#laneHits').innerHTML=t.lines.map(l=>`<tr><td class=t>${hms(l.t)}</td><td>${esc(l.text)}</td></tr>`).join('');
 }
+function closeLane(){_lane=null;renderPeople();}
 async function cancelJob(){
  if(!confirm('Cancel this job? Downloaded/transcribed work stays on disk; re-running resumes.'))return;
  const r=await j(`/api/job/${_jobId}/cancel`,{method:'POST'});

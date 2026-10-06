@@ -470,6 +470,12 @@ def main():
                 job.set(tag, "done", secs=round(time.time() - t0))
             job.set(name, "done", secs=None)
             print(f"[vodpipe] ✓ {name}")
+        try:  # cheap (<1 s), non-fatal: per-person voice profiles for the UI
+            import voice_stats
+            voice_stats.run(job.dir, force=True)
+            print("[vodpipe] ✓ voice profiles (voice_stats.json)")
+        except Exception as e:
+            print(f"[vodpipe] voice profiles skipped: {str(e)[:100]}")
         print(f"[vodpipe] JOB COMPLETE: {job.dir}")
     finally:
         lk = workdir / "gpu.lock"
