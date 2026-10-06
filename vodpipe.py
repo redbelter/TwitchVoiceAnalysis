@@ -50,7 +50,9 @@ def job_id_for(s):
     m = re.search(r"clips\.twitch\.tv/([\w-]+)|twitch\.tv/\w+/clip/([\w-]+)", s)
     if m:
         return "c" + (m.group(1) or m.group(2))[:24].replace("-", "_")
-    return "f" + hashlib.sha1(s.lower().encode()).hexdigest()[:12]
+    # local files: same file must hash the same however it was typed/dropped
+    s = str(Path(s).resolve()).lower().replace("/", "\\")
+    return "f" + hashlib.sha1(s.encode()).hexdigest()[:12]
 
 
 def ffprobe_dur(p):

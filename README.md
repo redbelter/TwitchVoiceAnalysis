@@ -20,6 +20,21 @@ RTX 4080, ≈2 GB VRAM during whisper). No cloud, no API keys.
 
 ## Quick start
 
+### Double-click mode (Windows)
+
+| file | what it does |
+|---|---|
+| **Start VODPipe.bat** | starts the server (minimized window = live log) + opens http://127.0.0.1:5001 — paste URLs there, close the window when done |
+| **AnalyzeVideo.bat** | drag a video file onto it (or run it and paste a Twitch URL): runs the full pipeline with a visible progress window; re-drop the same file to resume |
+
+Per-machine settings (venv path) live in `vodpipe.local.bat` (gitignored):
+```
+set "VODPIPE_DIAR_PY=C:\path\to\venvs\diar\Scripts\python.exe"
+```
+Create it once next to the .bat files; everything picks it up.
+
+### CLI
+
 ```bash
 pip install -r requirements.txt          # root env: download + whisper + web
 # diar venv (isolated, has NeMo — see requirements-diar.txt for exact commands):
