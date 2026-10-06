@@ -1,0 +1,12 @@
+# root env (download / transcribe / label / web)
+yt-dlp>=2025.10
+faster-whisper>=1.2
+ctranslate2>=4.6
+numpy>=1.26
+scipy>=1.11
+soundfile>=0.12
+fastapi>=0.110
+uvicorn>=0.29
+# CUDA runtime DLLs for CTranslate2 on Windows (pip wheels, not drivers):
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

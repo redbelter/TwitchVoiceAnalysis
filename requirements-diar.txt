@@ -1,0 +1,16 @@
+# diar venv (NeMo stages only). Keep it ISOLATED from the root env.
+# Python 3.12 recommended. torch must come from the cu126 index FIRST:
+#   uv venv venvs/diar --python 3.12
+#   VIRTUAL_ENV=venvs/diar uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+#   VIRTUAL_ENV=venvs/diar uv pip install -r requirements-diar.txt
+# Then point the pipeline at it:
+#   set VODPIPE_DIAR_PY=<abs path>/venvs/diar/Scripts/python.exe
+#
+# nemo_toolkit pulls transformers/tokenizers; pin the modern range (old
+# transformers pins tokenizers versions that need a Rust toolchain to build).
+nemo_toolkit[asr]==3.0.0
+transformers>=4.44,<5
+tokenizers>=0.19
+soundfile>=0.12
+scipy>=1.11
+numpy>=1.26

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.part
+vp_wavs/
+vp_wavs2/
+.venv/
+venv/
+venvs/
