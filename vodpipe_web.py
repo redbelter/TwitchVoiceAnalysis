@@ -56,6 +56,11 @@ def load_jobs():
         j.setdefault("id", sp.parent.name)
         j["_size_mb"] = dir_size_mb(sp.parent)
         j["_dir"] = str(sp.parent)
+        mp = sp.parent / "meta.json"
+        if mp.exists():
+            m = _read_json_retry(mp)
+            if m:
+                j["_meta"] = m
         jobs.append(j)
     return jobs
 
@@ -548,8 +553,11 @@ async function tick(){
   const chips=STAGES.map(s=>{const v=st[s];return `<span class="st ${v?v.status:''}">${s}</span>`}).join('');
   const mb=J._size_mb||0;const size=mb>1024?(mb/1024).toFixed(1)+' GB':mb+' MB';
   const retry=!running?`<button onclick="event.preventDefault();rerunJob('${J.id}')" style="float:right;padding:2px 10px;font-size:11px">rerun</button>`:'';
-  return `<div class=job>${retry}<a href="#job/${J.id}" style="color:inherit;text-decoration:none"><b>${J.id}</b></a>
-   <span style="opacity:.6;font-size:12px"> ${esc((J.url||J.input||'').slice(0,80))}</span>
+  const M=J._meta||{};
+  const title=M.title?esc(String(M.title).slice(0,110)):'<span style="opacity:.55">…</span>';
+  const mparts=[M.kind&&M.kind!=='vod'?M.kind.toUpperCase():'',M.streamer?'@'+M.streamer:'',M.game,M.date?String(M.date).slice(0,10):'',M.duration_s?hms(M.duration_s):'',M.view_count?M.view_count+' views':''].filter(Boolean).map(esc).join(' · ');
+  return `<div class=job>${retry}<a href="#job/${J.id}" style="color:inherit;text-decoration:none"><b>${title}</b>${M.url?` <a href="${esc(M.url)}" target=_blank style="color:var(--accent,#8b8bff);text-decoration:none">↗</a>`:''}</a>
+   <div style="font-size:11px;color:var(--muted-foreground)">${J.id}${mparts?' · '+mparts:''}</div>
    <div style="font-size:11px;color:var(--muted-foreground);margin-top:2px">💾 ${size} · <a style="color:inherit;text-decoration:underline dotted;cursor:pointer" title="${esc(J._dir||'')} — click to open folder" onclick="event.preventDefault();openFolder('${J.id}')">${esc(J._dir||'')}</a></div>
    <div class=bar><i style="width:${n/STAGES.length*100}%"></i></div>${chips}</div>`;
  }).join('')||'<i>none yet</i>';

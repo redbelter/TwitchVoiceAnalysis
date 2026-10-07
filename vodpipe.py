@@ -449,6 +449,15 @@ def main():
                   min_segs=ns.min_segs, live=live)
     job.save()
 
+    # title/metadata as early as possible — job rows become recognizable
+    # ("what video is this?") instead of bare ids. Best-effort: no network
+    # or dead VOD just means no meta.json yet; chat stage refreshes it at end.
+    try:
+        import meta_job
+        meta_job.sync(job.dir)
+    except Exception as e:
+        print(f"[vodpipe] meta fetch skipped: {str(e)[:100]}")
+
     if not is_url and not Path(job.st["input"]).exists():
         sys.exit(f"[vodpipe] no such file: {job.st['input']}")
 

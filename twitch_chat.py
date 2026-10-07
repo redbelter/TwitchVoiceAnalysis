@@ -74,7 +74,16 @@ def msg_text(n):
 
 
 def meta_from(jobdir, video):
+    jobdir = Path(jobdir)
+    # merge on top of whatever meta_job fetched at job start (live titles,
+    # clip author, local-file entries) — never blank out known fields
     meta = {}
+    prev = jobdir / "meta.json"
+    if prev.exists():
+        try:
+            meta = json.loads(prev.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
     info = next(jobdir.glob("*.info.json"), None)     # yt-dlp dump (new downloads)
     if info:
         try:
@@ -88,13 +97,15 @@ def meta_from(jobdir, video):
     if video:
         owner = video.get("owner") or video.get("creator") or {}
         game = video.get("game")
-        meta.update({"title": meta.get("title") or video.get("title"),
+        meta.update({"kind": "vod",
+                     "title": video.get("title") or meta.get("title"),
+                     "note": None,          # live caveat no longer applies — VOD is final
                      "streamer": meta.get("uploader") or owner.get("login") or owner.get("displayName"),
                      "date": video.get("publishedAt") or video.get("recordedAt") or meta.get("upload_date"),
                      "duration_s": int(video.get("lengthSeconds") or meta.get("duration") or 0) or None,
                      "view_count": meta.get("view_count") or int(video.get("viewCount") or 0) or None,
                      "game": game.get("name") if isinstance(game, dict) else game,
-                     "url": meta.get("url") or f"https://www.twitch.tv/videos/{video.get('id')}"})
+                     "url": f"https://www.twitch.tv/videos/{video.get('id')}"})
     return {k: v for k, v in meta.items() if v not in (None, "", [])}
 
 
