@@ -486,7 +486,11 @@ function talkBar(sec,max){const w=Math.max(2,Math.min(100,sec/(max||1)*100));
 function personRow(nm,p,maxTalk){
  const v=_voice[nm]||{},solo=_lanes.indexOf(nm);
  const frag=p.n_segments<5;
+ const G={'female':['♀','#f778ba','voice-based estimate: female'],
+          'male':['♂','#58a6ff','voice-based estimate: male'],
+          'ambiguous':['?','#d29922','pitch in the male/female overlap zone']}[v.voice_gender]||['·','#555','pitch not measured'];
  return `<tr${frag?' style="opacity:.55"':''}>
+  <td title="${G[2]}${v.f0?' ('+v.f0+' Hz)':''}" style="text-align:center;color:${G[1]};font-size:14px">${G[0]}</td>
   <td class=lane>${esc(nm)}${p.joined_late?' <span style=font-size:10px>late</span>':''}</td>
   <td style="white-space:nowrap">${hms(p.talk_seconds)} · ${p.n_segments}s ${talkBar(p.talk_seconds,maxTalk)}</td>
   <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)">${esc(v.desc||(frag?'fragment — too brief to profile':'profile pending…'))}</td>

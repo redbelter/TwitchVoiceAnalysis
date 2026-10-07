@@ -29,18 +29,12 @@ def _frames(x, size=1024, hop=512):
     return x[idx]
 
 
-def f0_stats(wavpath, max_frames=2600):
-    """Median pitch + stability from autocorrelation; (None, None) if no speech."""
-    x, sr = sf.read(str(wavpath), dtype="float32")
-    if x.ndim > 1:
-        x = x.mean(axis=1)
-    if sr != SR:  # resample by naive decimation only for integer ratios
-        import soxr  # not guaranteed present; fall back
-        raise RuntimeError("solo wavs are 16k by construction")
+def f0_from_signal(x, max_frames=2600):
+    """(median, iqr, p10) Hz from autocorrelation on float32 mono 16k; None-set if no speech."""
     x = np.concatenate([x, np.zeros(SR)])
     fr = _frames(x)
     if len(fr) == 0:
-        return None, None
+        return None, None, None
     e = (fr ** 2).mean(axis=1)
     keep = np.argsort(e)[::-1][:max_frames]           # loudest frames = speech
     fr = fr[keep]
@@ -57,9 +51,152 @@ def f0_stats(wavpath, max_frames=2600):
     conf = (seg.max(axis=1) - seg.mean(axis=1)) / (seg.std(axis=1) + 1e-9)
     voiced = (peak > 0.25) & (conf > 3.5)
     if voiced.sum() < 30:
-        return None, None
+        return None, None, None
     f0 = SR / (best[voiced] + lo)
-    return float(np.median(f0)), float(np.percentile(f0, 75) - np.percentile(f0, 25))
+    return (float(np.median(f0)),
+            float(np.percentile(f0, 75) - np.percentile(f0, 25)),
+            float(np.percentile(f0, 10)))
+
+
+def f0_stats(wavpath, max_frames=2600):
+    """Median pitch + stability + low-floor from a wav (kept for solo tracks)."""
+    x, sr = sf.read(str(wavpath), dtype="float32")
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    if sr != SR:  # resample by naive decimation only for integer ratios
+        import soxr  # not guaranteed present; fall back
+        raise RuntimeError("solo wavs are 16k by construction")
+    return f0_from_signal(x, max_frames)
+
+
+# --- whole-audio reader (so lanes WITHOUT solo tracks still get pitch) ------
+_audio_cache = {}
+
+
+def lane_pcm(jobdir):
+    """Decode job audio.mp3/wav ONCE to int16 mono 16k numpy (shared across lanes)."""
+    key = str(jobdir)
+    if key in _audio_cache:
+        return _audio_cache[key]
+    src = None
+    for cand in ("audio.mp3", "audio.wav", "audio.m4a"):
+        if (jobdir / cand).exists():
+            src = jobdir / cand
+            break
+    if not src:
+        return None
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(src), "-ac", "1", "-ar", str(SR),
+             "-f", "s16le", "-"], capture_output=True)
+        if r.returncode != 0 or not r.stdout:
+            return None
+        x = np.frombuffer(r.stdout, dtype=np.int16)
+    except Exception:
+        return None
+    _audio_cache[key] = x
+    return x
+
+
+def lane_ranges(jobdir):
+    """rttm.json [[start,end,'speaker_N'],...] -> {N: [(s,e),...]}"""
+    try:
+        rttm = json.loads((jobdir / "rttm.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out = {}
+    for seg in rttm:
+        try:
+            s, e, spk = seg[0], seg[1], seg[2]
+        except Exception:
+            continue
+        n = re.search(r"(\d+)$", str(spk))
+        if n:
+            out.setdefault(int(n.group(1)), []).append((float(s), float(e)))
+    return out
+
+
+def _job_media(jobdir):
+    """(pcm int16 mono 16k, transcript segments) — decoded once per job."""
+    pcm = lane_pcm(jobdir)
+    try:
+        segs = json.loads((jobdir / "transcript.json").read_text(encoding="utf-8"))["segments"]
+    except Exception:
+        segs = None
+    return pcm, segs
+
+
+_name_ranges_cache = {}
+
+
+def name_time_ranges(jobdir, nm):
+    """[(start,end)] for every transcript line spoken by `nm` (per labeled.txt,
+    i.e. AFTER fragment consolidation — the final attribution)."""
+    key = (str(jobdir), nm)
+    if key in _name_ranges_cache:
+        return _name_ranges_cache[key]
+    pcm, segs = _job_media(jobdir)
+    out = []
+    if pcm is not None:
+        try:
+            lines = (jobdir / "labeled.txt").read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            lines = []
+        for k, ln in enumerate(lines):
+            m = _LN_RE.match(ln.strip())
+            if not m or m[4].strip() != nm:
+                continue
+            # trust labeled.txt's own timestamp; borrow the segment's duration
+            # only when the two line up (guards against any index drift)
+            s = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+            e = s + 3.0
+            if segs and k < len(segs):
+                d = float(segs[k].get("end", 0)) - float(segs[k].get("start", 0))
+                if abs(float(segs[k].get("start", -99)) - s) < 2 and 0.1 <= d <= 30:
+                    e = s + d
+            out.append((s, e))
+    _name_ranges_cache[key] = out
+    return out
+
+
+def f0_for_name(jobdir, nm, max_seconds=900):
+    """Pitch for ANY major lane (incl. seeded STREAMER) by cutting its own
+    transcript spans out of the job audio — no solo track needed. Other
+    speakers bleed in during overlap, but autocorrelation tracks the dominant
+    pitch, and gender bands are wide enough that bleed doesn't matter."""
+    pcm, _ = _job_media(jobdir)
+    spans = name_time_ranges(jobdir, nm)
+    if pcm is None or not spans:
+        return None, None, None
+    chunks, tot = [], 0.0
+    for s, e in sorted(spans):
+        if tot >= max_seconds:
+            break
+        a, b = int(s * SR), min(int(e * SR), len(pcm))
+        if b - a > SR // 8:                       # >125ms of audio
+            chunks.append(pcm[a:b])
+            tot += (b - a) / SR
+    if not chunks:
+        return None, None, None
+    x = np.concatenate(chunks).astype("float32") / 32768.0
+    return f0_from_signal(x)
+
+
+def gender_of(med, p10):
+    """Voice-only gender ESTIMATE with honesty about the gray zone.
+    Population medians overlap ~140-170 Hz; we say so instead of guessing."""
+    if med is None:
+        return None, None
+    if med >= 185:
+        return "female", "high"
+    if med >= 165 and (p10 is None or p10 >= 125):
+        return "female", "likely"
+    if med < 120:
+        return "male", "high"
+    if med < 150:
+        return "male", "likely"
+    return "ambiguous", None
 
 
 _LN_RE = re.compile(r"\[(\d\d):(\d\d):(\d\d(?:\.\d+)?)\]\s*\(?\s*([^:()\[\]]+?)\s*\)?:\s*(.*)")
@@ -95,6 +232,9 @@ def pitch_word(med):
 
 def describe_lane(lane, stats, total_words):
     bits = []
+    g, conf = stats.get("voice_gender"), stats.get("gender_confidence")
+    if g:
+        bits.append(g + " voice" + (" (likely)" if conf == "likely" else ""))
     med, iqr = stats.get("f0"), stats.get("f0_iqr")
     if stats.get("f0"):
         stab = "steady" if iqr and iqr < 22 else "expressive" if iqr else ""
@@ -128,8 +268,10 @@ def run(jobdir, force=False):
     if out.exists() and not force:
         return json.loads(out.read_text(encoding="utf-8"))
     people = json.loads((jobdir / "people.json").read_text(encoding="utf-8"))
-    state = json.loads((jobdir / "state.json").read_text(encoding="utf-8"))
-    lanes = state.get("lanes") or []
+    try:
+        lanes = json.loads((jobdir / "state.json").read_text(encoding="utf-8")).get("lanes") or []
+    except Exception:
+        lanes = []                              # solo_N index == position in this list
     labeled = jobdir / "labeled.txt"
     total_words = sum(p.get("n_segments", 0) for p in people.values()) or 1
     res = {}
@@ -156,13 +298,25 @@ def run(jobdir, force=False):
               "joined_late": bool(p.get("joined_late"))}
         i = lanes.index(nm) if nm in lanes else -1
         wav = jobdir / f"solo_{i}_solo.wav" if i >= 0 else None
+        med = iqr = p10 = None
         if wav and wav.exists():
             try:
-                med, iqr = f0_stats(wav)
-                st["f0"] = med and round(med, 1)
-                st["f0_iqr"] = iqr and round(iqr, 1)
+                med, iqr, p10 = f0_stats(wav)
             except Exception as e:
                 st["f0_err"] = str(e)[:120]
+        if med is None:                         # no solo track (or STREAMER):
+            try:                                # cut this name's spans from audio
+                med, iqr, p10 = f0_for_name(jobdir, nm)
+            except Exception:
+                pass
+        if med is not None:
+            st["f0"] = round(med, 1)
+            st["f0_iqr"] = round(iqr, 1)
+            st["f0_p10"] = round(p10, 1)
+            g, conf = gender_of(med, p10)
+            st["voice_gender"] = g
+            if conf:
+                st["gender_confidence"] = conf
         st["desc"] = describe_lane(nm, st, total_words)
         res[nm] = st
     from vodpipe import atomic_write
