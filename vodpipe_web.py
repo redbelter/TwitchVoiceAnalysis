@@ -401,6 +401,12 @@ button{cursor:pointer;background:var(--accent,#5b5bd6);border-color:transparent}
 .offline,.waiting{color:#9a9aa2;border-style:dashed}.partial{color:#f0c674}
 table{border-collapse:collapse;width:100%;font-size:13px}
 td{padding:3px 8px;border-bottom:1px solid var(--border,#222);vertical-align:top}
+/* People stays compact: ~10 visible rows, scroll for the rest — a 200-speaker
+   job must not push the watch view off-screen. */
+.pplscroll{max-height:186px;overflow-y:auto;border:1px solid var(--border,#222);
+ border-radius:8px;background:var(--card,#141414)}
+.pplscroll table{font-size:12px}
+.pplscroll td{padding:2px 8px}
 td.t{white-space:nowrap;color:var(--muted-foreground,#9a9aa2)}
 a.t{color:var(--muted-foreground,#9a9aa2);text-decoration:none;cursor:pointer}
 .lane{font-weight:600}
@@ -492,9 +498,9 @@ function renderPeople(){
  const frags=_people.filter(([,p])=>p.n_segments<5);
  const maxT=Math.max(1,...majors.map(([,p])=>p.talk_seconds||0));
  box.innerHTML=`<h2>People <span style="font-weight:400;font-size:12px;color:var(--muted-foreground)">${majors.length} speakers · ${frags.length} fragments</span></h2>
-  <table>${majors.map(([nm,p])=>personRow(nm,p,maxT)).join('')}</table>
+  <div class=pplscroll><table>${majors.map(([nm,p])=>personRow(nm,p,maxT)).join('')}</table></div>
   ${frags.length?`<details style="margin-top:6px"><summary>show ${frags.length} fragment lanes (1-4 utterances: brief/crosstalk voices, no solo tracks)</summary>
-   <table>${frags.map(([nm,p])=>personRow(nm,p,0)).join('')}</table></details>`:''}
+   <div class=pplscroll><table>${frags.map(([nm,p])=>personRow(nm,p,0)).join('')}</table></div></details>`:''}
   <div id=laneBox2></div>`;
 }
 
