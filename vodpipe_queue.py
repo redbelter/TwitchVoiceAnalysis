@@ -31,7 +31,7 @@ def now():
 
 
 def save_q(path, q):
-    path.write_text(json.dumps(q, indent=1, ensure_ascii=False), encoding="utf-8")
+    vodpipe.atomic_write(path, json.dumps(q, indent=1, ensure_ascii=False))
 
 
 def budget_items(items, workdir, max_gb):

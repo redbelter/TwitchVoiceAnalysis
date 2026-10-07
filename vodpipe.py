@@ -43,6 +43,23 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).parent
+
+
+def atomic_write(p, text):
+    """Readers poll these files constantly (dashboard reads state.json every
+    2.5 s); a direct write_text truncates-then-refills and readers can land
+    mid-truncate -> job vanishes from the list until the next save. Write a
+    temp file, then os.replace (atomic on NTFS). On Windows the replace can
+    hit Access-denied while a reader holds the file open — retry briefly."""
+    tmp = p.with_name(f".{p.name}.tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    for _ in range(100):
+        try:
+            os.replace(tmp, p)
+            return
+        except PermissionError:
+            time.sleep(0.02)
+    os.replace(tmp, p)  # last attempt — surface the error if still stuck
 DEFAULT_DIAR = os.environ.get("VODPIPE_DIAR_PY", "")
 STAGES = ["download", "audio", "transcribe", "diarize", "voiceprint",
           "label", "frag", "solos", "reasr", "clean", "scan"]
@@ -88,7 +105,7 @@ class Job:
             sys.exit(f"[vodpipe] no job '{jid}' in {workdir}")
 
     def save(self):
-        self.path.write_text(json.dumps(self.st, indent=1), encoding="utf-8")
+        atomic_write(self.path, json.dumps(self.st, indent=1))
 
     def stage(self, name):
         return self.st.setdefault("stages", {}).setdefault(name, {"status": "pending"})
@@ -123,15 +140,25 @@ def pid_alive(pid):
 def run(cmd, log, stage, job):
     print(f"[vodpipe] $ {' '.join(str(c) for c in cmd)}")
     prog = job.stage(stage).setdefault("prog", {})
+    # child stdout is a PIPE -> python block-buffers prints (8 KB) and the
+    # log looks dead for ages then dumps a wall of text. Unbuffer it.
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     with open(log, "a", encoding="utf-8", errors="replace") as lf:
         lf.write(f"\n===== {time.strftime('%F %T')} :: {stage} =====\n")
         lf.flush()
         p = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True,
-                             encoding="utf-8", errors="replace", cwd=str(job.dir))
+                             encoding="utf-8", errors="replace", cwd=str(job.dir),
+                             env=env)
+        last_flush = 0.0
         for line in p.stdout:
             lf.write(line)
-            if line.startswith("[") and "] " in line[:15]:
+            # readers tail this file live — don't let it sit in the buffer
+            need = line.startswith("[") and "] " in line[:15]
+            if need or time.time() - last_flush > 0.5:
+                lf.flush(); last_flush = time.time()
+            if need:
                 print("    " + line.rstrip()[:120])
                 st = job.stage(stage)
                 st["last"] = line.split("]", 1)[1].strip()[:160]

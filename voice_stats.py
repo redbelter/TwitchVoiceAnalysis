@@ -165,7 +165,8 @@ def run(jobdir, force=False):
                 st["f0_err"] = str(e)[:120]
         st["desc"] = describe_lane(nm, st, total_words)
         res[nm] = st
-    out.write_text(json.dumps(res, indent=1, ensure_ascii=False), encoding="utf-8")
+    from vodpipe import atomic_write
+    atomic_write(out, json.dumps(res, indent=1, ensure_ascii=False))
     return res
 
 

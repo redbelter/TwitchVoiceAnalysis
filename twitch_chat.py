@@ -115,14 +115,14 @@ def run(jobdir, max_messages=120000, force=False):
              "user": (n.get("commenter") or {}).get("displayName")
                      or (n.get("commenter") or {}).get("login") or "?",
              "text": msg_text(n)} for n in msgs]
-    cj.write_text(json.dumps(slim, ensure_ascii=False), encoding="utf-8")
+    from vodpipe import atomic_write
+    atomic_write(cj, json.dumps(slim, ensure_ascii=False))
     with open(jobdir / "chat.txt", "w", encoding="utf-8") as f:
         for s in slim:
             f.write(f"[{s['t']//3600:02d}:{s['t']%3600//60:02d}:{s['t']%60:02d}] "
                     f"{s['user']}: {s['text']}\n")
-    (jobdir / "meta.json").write_text(
-        json.dumps(meta_from(jobdir, video), indent=1, ensure_ascii=False),
-        encoding="utf-8")
+    atomic_write(jobdir / "meta.json",
+                 json.dumps(meta_from(jobdir, video), indent=1, ensure_ascii=False))
     tag(f"wrote chat.json ({len(slim)} msgs), chat.txt, meta.json")
 
 

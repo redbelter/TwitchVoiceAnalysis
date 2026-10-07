@@ -35,6 +35,8 @@ from pathlib import Path
 
 import numpy as np
 
+from vodpipe import atomic_write  # same repo; state/artifact files are read mid-write by the dashboard
+
 LINE_RE = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\]\s*([^:]+):\s*(.*)$")
 
 
@@ -184,12 +186,12 @@ def run(jobdir, hi=0.40, lo=0.30, min_lane=8, protect=5, adj=10.0,
     stats["short_left"] = len(short_segs) - vote_changed
     if not new_disp:
         stats.update(changed=0, people_before=len(P), people_after=len(P), hi=hi, lo=lo)
-        (d / "fragmerged.json").write_text(json.dumps(stats, indent=1), encoding="utf-8")
+        atomic_write(d / "fragmerged.json", json.dumps(stats, indent=1))
         return {**stats, "note": "nothing accepted"}
 
     # rewrite labeled.txt + recompute people.json
     if not (d / "labeled.pre_frag.txt").exists():
-        (d / "labeled.pre_frag.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        atomic_write(d / "labeled.pre_frag.txt", "\n".join(lines) + "\n")
     out, final = [], {}
     changed = 0
     for i, ln in enumerate(lines):
@@ -207,7 +209,7 @@ def run(jobdir, hi=0.40, lo=0.30, min_lane=8, protect=5, adj=10.0,
             s["first"] = min(s["first"], segs[i]["start"])
             s["last"] = max(s["last"], segs[i]["end"])
         s["n"] += 1
-    labeled.write_text("\n".join(out) + "\n", encoding="utf-8")
+    atomic_write(labeled, "\n".join(out) + "\n")
 
     new_people = {}
     for nm, s in final.items():
@@ -220,11 +222,11 @@ def run(jobdir, hi=0.40, lo=0.30, min_lane=8, protect=5, adj=10.0,
                           "last_ts": hms(s["last"]),
                           "n_segments": s["n"],
                           "joined_late": old.get("joined_late", False)}
-    people.write_text(json.dumps(new_people, indent=1), encoding="utf-8")
+    atomic_write(people, json.dumps(new_people, indent=1))
 
     stats.update(changed=changed, people_before=len(P), people_after=len(new_people),
                  hi=hi, lo=lo)
-    (d / "fragmerged.json").write_text(json.dumps(stats, indent=1), encoding="utf-8")
+    atomic_write(d / "fragmerged.json", json.dumps(stats, indent=1))
     if changed:
         # downstream artifacts were cut from the OLD labels — drop them so the
         # pipeline rebuilds against the consolidated people (voice descriptions,

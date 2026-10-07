@@ -15,6 +15,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -23,6 +24,24 @@ from fastapi.middleware.cors import CORSMiddleware
 
 HERE = Path(__file__).parent
 WORKDIR = Path.home() / "Downloads" / "vodpipe"
+
+
+def _load_local_env():
+    """The .bat launchers set VODPIPE_DIAR_PY via vodpipe.local.bat, but jobs
+    spawned from THIS server never saw it — dashboard jobs then died at the
+    NeMo stages. Parse the same file once at import."""
+    import os
+    if os.environ.get("VODPIPE_DIAR_PY"):
+        return
+    loc = HERE / "vodpipe.local.bat"
+    if not loc.exists():
+        return
+    import re as _re
+    for m in _re.finditer(r'set\s+"?(\w+)=([^"\r\n]+)"?', loc.read_text(encoding="utf-8", errors="replace")):
+        os.environ.setdefault(m.group(1), m.group(2).strip())
+
+
+_load_local_env()
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"])
 
@@ -32,11 +51,60 @@ _ts_re = re.compile(r"\[(\d+):(\d+):(\d+(?:\.\d+)?)\]\s*(?:(\S+):\s*)?(.*)")
 def load_jobs():
     jobs = []
     for sp in sorted(WORKDIR.glob("*/state.json")):
-        try:
-            jobs.append(json.loads(sp.read_text(encoding="utf-8")))
-        except Exception:
-            pass
+        j = _read_json_retry(sp) or {"id": sp.parent.name, "stages": {},
+                                     "url": "", "input": "(saving…)"}
+        j.setdefault("id", sp.parent.name)
+        j["_size_mb"] = dir_size_mb(sp.parent)
+        j["_dir"] = str(sp.parent)
+        jobs.append(j)
     return jobs
+
+
+def _read_json_retry(p, tries=12):
+    """Windows: os.replace can leave a file briefly un-openable by a second
+    reader (share error). State files are small; a 20 ms backoff is invisible
+    at dashboard poll rates and turns 'job vanished for a moment' into nothing."""
+    for i in range(tries):
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (PermissionError, FileNotFoundError):
+            time.sleep(0.02)
+        except json.JSONDecodeError:
+            if i < tries - 1:
+                time.sleep(0.02)
+                continue
+            return None
+    return None
+
+
+def _read_text_retry(p, tries=12):
+    for i in range(tries):
+        try:
+            return p.read_text(encoding="utf-8", errors="replace")
+        except (PermissionError, FileNotFoundError):
+            time.sleep(0.02)
+    return ""
+
+
+_size_cache = {}
+
+
+def dir_size_mb(d):
+    """Cached per dir (20 s TTL) — job dirs hold 1000s of small files
+    (vp_wavs2 slices); walking every one on every 3 s tick would be the
+    slowest part of the page."""
+    key = str(d)
+    hit = _size_cache.get(key)
+    now = time.time()
+    if hit and now - hit[1] < 20:
+        return hit[0]
+    try:
+        mb = round(sum(f.stat().st_size for f in d.rglob("*")
+                       if f.is_file() and "_stale_parts" not in str(f)) / 1048576)
+    except OSError:
+        mb = hit[0] if hit else 0
+    _size_cache[key] = (mb, now)
+    return mb
 
 
 def job_dir(jid):
@@ -69,6 +137,12 @@ async def api_new(payload: dict):
     jdir = WORKDIR / jid
     jdir.mkdir(parents=True, exist_ok=True)
     (jdir / "logs").mkdir(exist_ok=True)
+    # create state NOW, synchronously: the child takes a few seconds to boot,
+    # and a job that only exists after spawn disappears from the list until then
+    if not (jdir / "state.json").exists():
+        vp.Job(jdir.parent, jid, create=True,
+               **({"url": target} if target.startswith("http") or "twitch.tv" in target
+                  else {"input": target}))
     spawn_log = open(jdir / "logs" / "spawn.log", "a", encoding="utf-8")
     # never DEVNULL: tracebacks would vanish and the job would die silently
     p = subprocess.Popen(cmd, stdout=spawn_log, stderr=spawn_log)
@@ -82,12 +156,46 @@ def api_cancel(jid: str):
     return vp.cancel_job(WORKDIR, jid)
 
 
+@app.post("/api/job/{jid}/rerun")
+def api_rerun(jid: str):
+    """Re-spawn a stopped/failed/cancelled job. Idempotent stages skip via
+    their cached artifacts, so this resumes cheaply — and redoes exactly what
+    was dropped (e.g. solos re-cut after fragment consolidation)."""
+    d = job_dir(jid)
+    st = _read_json_retry(d / "state.json") or {}
+    import vodpipe as vp
+    target = st.get("url") or st.get("input") or ""
+    if not target:
+        raise HTTPException(400, "job has no url/input to rerun from")
+    live = (st.get("stages", {}))
+    if any(v.get("status") == "running" for v in live.values()) and vp.pid_alive(st.get("runner_pid")):
+        raise HTTPException(409, "already running")
+    cmd = [sys.executable, str(HERE / "vodpipe.py"), target, "--workdir", str(WORKDIR)]
+    if st.get("diar_py"):
+        cmd += ["--diar-python", st["diar_py"]]
+    for s in st.get("seeds", []):
+        cmd += ["--seed", s]
+    if st.get("streamer"):
+        cmd += ["--streamer", st["streamer"]]
+    (d / "logs").mkdir(exist_ok=True)
+    with open(d / "logs" / "spawn.log", "a", encoding="utf-8") as lg:
+        p = subprocess.Popen(cmd, stdout=lg, stderr=lg)
+    return {"job": jid, "started_pid": p.pid}
+
+
+@app.post("/api/job/{jid}/open")
+def api_open(jid: str):
+    d = job_dir(jid)
+    subprocess.Popen(["explorer", str(d)])   # explorer returns nonzero even on success
+    return {"dir": str(d)}
+
+
 @app.get("/api/queues")
 def api_queues():
     out = []
     for p in sorted(WORKDIR.glob("queue_*.json")):
         try:
-            q = json.loads(p.read_text(encoding="utf-8"))
+            q = _read_json_retry(p) or {}
             q["counts"] = {s: sum(1 for it in q["items"] if it["status"] == s)
                            for s in ("pending", "running", "done", "cached",
                                      "offline", "failed", "partial")}
@@ -134,16 +242,14 @@ def api_queue_cancel(login: str):
 @app.get("/api/job/{jid}")
 def api_job(jid: str):
     d = job_dir(jid)
-    st = json.loads((d / "state.json").read_text(encoding="utf-8"))
+    st = _read_json_retry(d / "state.json") or {}
+    st["id"] = st.get("id") or jid
     st["_artifacts"] = {n: (d / n).exists() for n in
                         ("labeled.txt", "people.json", "scan_flirting.txt",
                          "chat.json", "voice_stats.json")}
     meta_p = d / "meta.json"
     if meta_p.exists():
-        try:
-            st["_meta"] = json.loads(meta_p.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        st["_meta"] = _read_json_retry(meta_p)
     # live download size while the mp4 is still a .part (largest wins —
     # stale parts from earlier runs can coexist)
     parts = list(d.glob("*.part"))
@@ -154,6 +260,8 @@ def api_job(jid: str):
     st["_audio"] = "audio.mp3" if (d / "audio.mp3").exists() else None
     fm = d / "fragmerged.json"
     st["_frag"] = round(fm.stat().st_mtime) if fm.exists() else None
+    st["_size_mb"] = dir_size_mb(d)
+    st["_dir"] = str(d)
     return st
 
 
@@ -163,14 +271,13 @@ def api_log(jid: str, stage: str, tail: int = 14):
     p = d / "logs" / f"{stage}.log"
     if not p.exists():
         return {"lines": []}
-    return {"lines": p.read_text(encoding="utf-8", errors="replace")
-            .splitlines()[-tail:]}
+    return {"lines": _read_text_retry(p).splitlines()[-tail:]}
 
 
 @app.get("/api/job/{jid}/people")
 def api_people(jid: str):
     p = job_dir(jid) / "people.json"
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    return _read_json_retry(p) if p.exists() else {}
 
 
 @app.get("/api/job/{jid}/voices")
@@ -181,11 +288,11 @@ def api_voices(jid: str):
     d = job_dir(jid)
     cached = d / "voice_stats.json"
     if cached.exists():
-        return json.loads(cached.read_text(encoding="utf-8"))
+        return _read_json_retry(cached) or {}
     if not (d / "people.json").exists():
         return {}
     try:
-        st = json.loads((d / "state.json").read_text(encoding="utf-8"))
+        st = _read_json_retry(d / "state.json") or {}
         vals = list(st.get("stages", {}).values())
         running = any(v.get("status") == "running" for v in vals)
         settled = bool(vals) and not running
@@ -209,7 +316,7 @@ def api_transcript(jid: str, q: str = "", lane: str = "", limit: int = 400):
         return {"lines": []}
     ql = q.lower()
     out = []
-    for ln in src.read_text(encoding="utf-8").splitlines():
+    for ln in _read_text_retry(src).splitlines():
         m = _ts_re.match(ln)
         if not m:
             continue
@@ -231,7 +338,7 @@ def hms_to_s(h, m, s):
 @app.get("/api/job/{jid}/scan")
 def api_scan(jid: str):
     p = job_dir(jid) / "scan_flirting.txt"
-    return {"text": p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""}
+    return {"text": _read_text_retry(p) if p.exists() else ""}
 
 
 @app.get("/api/job/{jid}/chat")
@@ -243,7 +350,7 @@ def api_chat(jid: str, q: str = "", user: str = "", around: float = -1,
     p = job_dir(jid) / "chat.json"
     if not p.exists():
         return {"lines": [], "total": 0}
-    msgs = json.loads(p.read_text(encoding="utf-8"))
+    msgs = _read_json_retry(p) or []
     ql = q.lower()
     out = []
     for m in msgs:
@@ -435,14 +542,26 @@ async function tick(){
  const jobs=await j('/api/jobs');
  $('#jobs').innerHTML=jobs.map(J=>{
   const st=J.stages||{};let n=0;
+  const vals=Object.values(st);
   for(const s of STAGES) if(st[s]&&st[s].status==='done')n++;
+  const running=vals.some(v=>v.status==='running');
   const chips=STAGES.map(s=>{const v=st[s];return `<span class="st ${v?v.status:''}">${s}</span>`}).join('');
-  return `<div class=job><a href="#job/${J.id}" style="color:inherit;text-decoration:none"><b>${J.id}</b></a>
+  const mb=J._size_mb||0;const size=mb>1024?(mb/1024).toFixed(1)+' GB':mb+' MB';
+  const retry=!running?`<button onclick="event.preventDefault();rerunJob('${J.id}')" style="float:right;padding:2px 10px;font-size:11px">rerun</button>`:'';
+  return `<div class=job>${retry}<a href="#job/${J.id}" style="color:inherit;text-decoration:none"><b>${J.id}</b></a>
    <span style="opacity:.6;font-size:12px"> ${esc((J.url||J.input||'').slice(0,80))}</span>
+   <div style="font-size:11px;color:var(--muted-foreground);margin-top:2px">💾 ${size} · <a style="color:inherit;text-decoration:underline dotted;cursor:pointer" title="${esc(J._dir||'')} — click to open folder" onclick="event.preventDefault();openFolder('${J.id}')">${esc(J._dir||'')}</a></div>
    <div class=bar><i style="width:${n/STAGES.length*100}%"></i></div>${chips}</div>`;
  }).join('')||'<i>none yet</i>';
  _timer=setTimeout(tick,3000);
 }
+async function rerunJob(id){
+ const r=await fetch(`/api/job/${id}/rerun`,{method:'POST'});
+ if(r.status===409){alert('Job is already running');return;}
+ console.log('rerun',id,await r.json().catch(()=>({})));
+ setTimeout(tick,1200);
+}
+async function openFolder(id){await j(`/api/job/${id}/open`,{method:'POST'});}
 
 /* ---------------- live job view ---------------- */
 function stopTimer(){if(_timer){clearTimeout(_timer);_timer=null}}
@@ -477,9 +596,12 @@ async function jobTick(){
  if(a)frac=((act.total>1)?((act.sub+(p.pct!=null?p.pct/100:0))/act.total)
         :(p.pct!=null?p.pct/100:0))/STAGES.length;
  $('#prog').innerHTML=`<div class=bar><i style="width:${Math.min(100,(n/STAGES.length+frac)*100)}%"></i></div>${chips}`;
- if(J.cancelled)$('#prog').innerHTML+=`<div style="font-size:12px;color:#ff7b72;margin-top:4px">cancelled — re-run the launcher to resume from cache</div>`;
+ if(J.cancelled)$('#prog').innerHTML+=`<div style="font-size:12px;color:#ff7b72;margin-top:4px">cancelled — <button onclick="rerunJob(_jobId)" style="padding:2px 10px;font-size:11px">rerun</button> resumes from cache</div>`;
  else if(Object.values(st).some(v=>v.status==='failed'))
-  $('#prog').innerHTML+=`<div style="font-size:12px;color:#ff7b72;margin-top:4px">failed — see log below; fix the cause and re-run resumes from cache</div>`;
+  $('#prog').innerHTML+=`<div style="font-size:12px;color:#ff7b72;margin-top:4px">failed — see log below; fix the cause, then <button onclick="rerunJob(_jobId)" style="padding:2px 10px;font-size:11px">rerun</button> (resumes from cache)</div>`;
+ if(!running)$('#prog').innerHTML+=`<div style="font-size:12px;color:var(--muted-foreground);margin-top:4px">
+  💾 ${J._size_mb>1024?(J._size_mb/1024).toFixed(1)+' GB':(J._size_mb||0)+' MB'} on disk · <a style="color:var(--accent,#8b8bff);cursor:pointer" title="${esc(J._dir||'')}" onclick="openFolder(_jobId)">${esc(J._dir||'')}</a>
+  ${n<STAGES.length?` · <button onclick="rerunJob(_jobId)" style="padding:2px 10px;font-size:11px">rerun / resume</button>`:''}</div>`;
  if(a){
   const parts=[];
   if(p.pct!=null)parts.push(p.pct.toFixed(1)+'%');

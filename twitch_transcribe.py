@@ -162,7 +162,7 @@ def main():
                 break
             seg_list.append((seg.start, seg.end, seg.text.strip()))
             now = time.time()
-            if now - last_print > 20:
+            if now - last_print > 5:
                 pct = f" {100*seg.end/total:4.1f}%" if total else ""
                 rate = seg.end / max(now - t0, 1)
                 eta = fmt_hms((total - seg.end) / rate) if (total and rate > 0) else "?"

@@ -73,7 +73,8 @@ def main():
         out_lines.append("")
     head = (f"FLIRTING-REGISTER EXTRACT from {src.name}\n"
             f"{len(blocks)} blocks around {len(hits)} trigger lines (catchphrase noise filtered)\n\n")
-    out.write_text(head + "\n".join(out_lines), encoding="utf-8")
+    from vodpipe import atomic_write
+    atomic_write(out, head + "\n".join(out_lines))
     print(f"{len(hits)} triggers -> {len(blocks)} blocks -> {out}")
 
 
