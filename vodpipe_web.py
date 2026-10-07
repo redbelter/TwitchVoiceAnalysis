@@ -850,7 +850,7 @@ async function trustSpoken(lane){
 }
 async function setGender(lane){
  const cur=(_voice[lane]||{}).voice_gender||'';
- const g=(prompt(`Set gender for ${lane} (you know what a voice changer sounds like; the machine doesn't).\n${cur?'Currently: '+cur+'\n':''}Type male, female, or ambiguous — leave empty to clear the override:`,'')||'').trim().toLowerCase();
+ const g=(prompt('Set gender for '+lane+' — type male, female, or ambiguous. Leave empty to clear the override.'+(cur?' (currently: '+cur+')':''),'')||'').trim().toLowerCase();
  if(g&&!['male','female','ambiguous'].includes(g)){alert('must be male, female, or ambiguous');return}
  try{await j(`/api/job/${_jobId}/gender_override`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lane,gender:g})});
   try{_voice=await j(`/api/job/${_jobId}/voices`);}catch(e){}
