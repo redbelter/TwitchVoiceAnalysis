@@ -528,12 +528,24 @@ def main():
             print("[vodpipe] ✓ voice profiles (voice_stats.json)")
         except Exception as e:
             print(f"[vodpipe] voice profiles skipped: {str(e)[:100]}")
+        try:  # optional (needs LAN LLM): qwen3.8 mines names+gender hints (~2-5 s/chunk)
+            import llm_names
+            r = llm_names.run(job.dir, force=True)
+            print(f"[vodpipe] ✓ LLM name mining ({len(r['votes'])} votes, {r['elapsed_s']} s)")
+        except Exception as e:
+            print(f"[vodpipe] LLM name mining skipped: {str(e)[:100]}")
         try:  # cheap, non-fatal: probable names from context (side-file only)
             import name_suggest
             r = name_suggest.run(job.dir, force=True)
             print(f"[vodpipe] ✓ name suggestions ({len(r['proposals'])} proposals)")
         except Exception as e:
             print(f"[vodpipe] name suggestions skipped: {str(e)[:100]}")
+        try:  # pitch + vocal-tract gender estimate (side file, ~40 s)
+            import voice_gender
+            voice_gender.run(job.dir, force=True)
+            print("[vodpipe] ✓ gender estimates (voice_gender.json)")
+        except Exception as e:
+            print(f"[vodpipe] gender estimates skipped: {str(e)[:100]}")
         print(f"[vodpipe] JOB COMPLETE: {job.dir}")
     finally:
         lk = workdir / "gpu.lock"

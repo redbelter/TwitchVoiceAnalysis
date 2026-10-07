@@ -293,7 +293,7 @@ def api_voices(jid: str):
     d = job_dir(jid)
     cached = d / "voice_stats.json"
     if cached.exists():
-        return _read_json_retry(cached) or {}
+        return _merge_voice_gender(d, _read_json_retry(cached) or {})
     if not (d / "people.json").exists():
         return {}
     try:
@@ -309,9 +309,29 @@ def api_voices(jid: str):
         return {}
     try:
         import voice_stats
-        return voice_stats.run(d)
+        return _merge_voice_gender(d, voice_stats.run(d))
     except Exception as e:
         raise HTTPException(500, f"voice stats failed: {str(e)[:200]}")
+
+
+def _merge_voice_gender(d, stats):
+    """Overlay the two-factor (pitch + vocal-tract formants) verdict from
+    voice_gender.json onto voice_stats, when available."""
+    vg_p = d / "voice_gender.json"
+    if not vg_p.exists():
+        return stats
+    vg = _read_json_retry(vg_p) or {}
+    for nm, g in vg.items():
+        if isinstance(g, dict) and nm in stats and g.get("voice_gender"):
+            stats[nm]["voice_gender"] = g["voice_gender"]
+            stats[nm]["gender_confidence"] = g.get("confidence")
+            if g.get("gfd"):
+                stats[nm]["gfd"] = g["gfd"]
+            if g.get("note"):
+                stats[nm]["gender_note"] = g["note"]
+            if g.get("mismatch"):
+                stats[nm]["gender_mismatch"] = True
+    return stats
 
 
 @app.get("/api/job/{jid}/names")
@@ -536,11 +556,12 @@ function personRow(nm,p,maxTalk){
           'male':['♂','#58a6ff','voice-based estimate: male'],
           'ambiguous':['?','#d29922','pitch in the male/female overlap zone']}[v.voice_gender]||['·','#555','pitch not measured'];
  const ns=_names[nm],ov=_nameOv[nm];
- const nmTip=ns?`name suggested from context (${esc(ns.confidence)} confidence):\n${esc((ns.evidence[0]?ns.evidence[0].kind+': '+ns.evidence[0].quote:''))}`:'';
+ const gcTip=ns&&ns.gender_conflict?`\ncall says ${ns.gender_conflict.spoken}, voice reads ${ns.gender_conflict.acoustic} (${ns.gender_conflict.votes.male||0}♂/${ns.gender_conflict.votes.female||0}♀ statements)`:'';
+ const nmTip=ns?`name suggested from context (${esc(ns.confidence)} confidence):\n${esc((ns.evidence[0]?ns.evidence[0].kind+': '+ns.evidence[0].quote:''))}${esc(gcTip)}`:'';
  const nameCell=ov?`<span title="confirmed name for ${esc(nm)}" style="color:#7ee08a;font-weight:700">${esc(ov)}</span> <span style="opacity:.45;font-size:10px">${esc(nm)}</span>`
   :esc(nm)+`${p.joined_late?' <span style=font-size:10px>late</span>':''}${ns?` <span title="${nmTip}" style="color:#7ee08a;font-weight:600;cursor:pointer" onclick="event.stopPropagation();applyName(${jsq(nm)},${jsq(ns.name)})">💡${esc(ns.name)}</span>`:''}`;
  return `<tr${frag?' style="opacity:.55"':''}>
-  <td title="${G[2]}${v.f0?' ('+v.f0+' Hz)':''}" style="text-align:center;color:${G[1]};font-size:14px">${G[0]}</td>
+  <td title="${G[2]}${v.f0?' ('+v.f0+' Hz)':''}${v.gfd?' · tract index '+v.gfd:''}${v.gender_note?' · '+esc(v.gender_note):''}" style="text-align:center;color:${G[1]};font-size:14px">${G[0]}${v.gender_mismatch?'⚠':''}</td>
   <td class=lane>${nameCell}</td>
   <td style="white-space:nowrap">${hms(p.talk_seconds)} · ${p.n_segments}s ${talkBar(p.talk_seconds,maxTalk)}</td>
   <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)">${esc(v.desc||(frag?'fragment — too brief to profile':'profile pending…'))}</td>

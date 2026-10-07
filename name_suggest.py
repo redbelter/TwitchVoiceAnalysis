@@ -26,6 +26,7 @@ import json
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 LN_RE = re.compile(r"\[(\d+):(\d+):(\d\d(?:\.\d+)?)\]\s*([^:]+?)\s*:\s*(.*)$")
@@ -183,6 +184,13 @@ def run(jobdir, force=False):
         voice = json.loads((jobdir / "voice_stats.json").read_text(encoding="utf-8"))
     except Exception:
         pass
+    # gender evidence per lane: LLM "gender" statements + name-catalog hints
+    spoken_g = {lane: Counter() for lane in people}
+    vg_est = {}
+    try:
+        vg_est = json.loads((jobdir / "voice_gender.json").read_text(encoding="utf-8"))
+    except Exception:
+        pass
 
     # votes: (lane, normname) -> {score, display, evidence:[...]}
     votes = {}
@@ -306,7 +314,8 @@ def run(jobdir, force=False):
                 # pair/reply junk must never launder itself via acoustic boost
                 vkinds = {ev["kind"] for ev in v["evidence"]}
                 if (v["score"] >= 2.0 and vlane in cents
-                        and vkinds <= {"self", "channel", "join"} and vkinds):
+                        and vkinds <= {"self", "channel", "join", "llm-self", "llm-join"}
+                        and vkinds):
                     cur = strong.get(vlane)
                     if cur is None or v["score"] > cur["score"]:
                         strong[vlane] = v
@@ -325,6 +334,52 @@ def run(jobdir, force=False):
                 disp = max(sv["display"].items(), key=lambda kv: kv[1])[0]
                 vote(nm, disp, 0, "acoustic", 2.0,
                      f"voiceprint cos {best[1]:.2f} vs {best[0]}")
+    except Exception:
+        pass
+
+    # --- LLM votes (llm_names.py side file, LAN model) -----------------------
+    # The model does real dialogue-structure attribution, so its address/join
+    # kinds replace our weakest regex heuristics. Lane IDs are validated:
+    # votes referencing lanes that don't exist in people.json are dropped.
+    try:
+        llm = json.loads((jobdir / "names_llm.json").read_text(encoding="utf-8"))
+        for v in llm.get("votes", []):
+            nm = v.get("name")
+            if not nm or not _ok_name(nm.split()[-1]) and not _ok_name(nm):
+                continue
+            kind = v.get("kind")
+            t = float(v.get("ts") or 0)
+            quote = f"llm: {v.get('quote') or ''}"
+            if kind == "self":
+                lane = v.get("speaker")
+                if lane in people:
+                    vote(lane, nm, t, "llm-self", 3.0, quote)
+            elif kind == "address":
+                lane = v.get("target")
+                if lane in people and v.get("speaker") != lane:
+                    vote(lane, nm, t, "llm-address", 1.5, quote)
+            elif kind == "join":
+                lane = v.get("target")
+                if lane in people:
+                    vote(lane, nm, t, "llm-join", 2.0, quote)
+                else:
+                    # unattributed: fall back to first-speaker timing
+                    starters = [ln for ln, ft in first_t.items()
+                                if 0 <= ft - t <= 15 and ln in people]
+                    if len(starters) == 1:
+                        vote(starters[0], nm, t, "llm-join", 2.0, quote)
+            elif kind == "gender":
+                said = (v.get("said") or "").lower()
+                if said not in ("male", "female"):
+                    continue
+                who = v.get("target") or v.get("speaker")
+                if who in people:
+                    spoken_g[who][said] += 1
+                    # a gendered nickname that IS the name links name+lane
+                    if _ok_name(nm):
+                        vote(who, nm, t, "llm-address", 1.2, quote)
+    except FileNotFoundError:
+        pass
     except Exception:
         pass
 
@@ -369,6 +424,22 @@ def run(jobdir, force=False):
         entry["confidence"] = conf
         if hint and g_est and hint != g_est:
             entry["gender_mismatch"] = f"name reads {hint}, voice reads {g_est}"
+        # spoken-gender vs acoustic-gender: what the CALL SAID about this
+        # person beats what their pitch sounds like (users told us acoustics
+        # lie — pitch shifters, voice training). Majority vote of gender
+        # statements attributed to this lane.
+        sg = spoken_g.get(lane)
+        if sg and sum(sg.values()) >= 2:
+            sg_maj = sg.most_common(1)[0][0]
+            acoustic = ((vg_est.get(lane) or {}).get("voice_gender")
+                        or (voice.get(lane) or {}).get("voice_gender"))
+            if acoustic == "ambiguous" or acoustic is None:
+                acoustic = None
+            if acoustic and acoustic != sg_maj:
+                entry["gender_conflict"] = {
+                    "spoken": sg_maj, "acoustic": acoustic,
+                    "votes": dict(sg),
+                }
         by_lane[lane] = entry
 
     # keep only proposals worth showing; raw votes stay for the CLI --all
