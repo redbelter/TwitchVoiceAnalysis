@@ -4,11 +4,15 @@ Pure text + timing statistics, no models, no network. Deterministic.
 
 Evidence kinds (each vote carries weight + a quotable timestamp):
   self     "I'm X" / "my name is X" inside a lane's own line      (w=3.0)
+  join     "X just joined / is here / hopped in" (chat OR read aloud)
+           and exactly one lane STARTS speaking within 15 s       (w=2.0)
   reply    chat message addresses NAME, lane starts speaking
            within -2..+12 s                                       (w=1.0, decays)
   pair     a line addresses NAME and the very next speaking
            turn (different lane) starts within 6 s                (w=0.8)
   channel  the job's Twitch login belongs to the STREAMER lane   (w=2.0)
+  acoustic voiceprint centroid matches a strongly-named lane at
+           cos>=0.55 (same person, diarization re-split)          (w=2.0)
 
 A (lane, name) pair becomes a PROPOSAL only when its margin over the
 runner-up lane is clear; otherwise it's reported as ambiguous. Names are
@@ -41,6 +45,14 @@ ADDR = re.compile(
 SELF = re.compile(
     r"\b(?:i'?m|i am|my name is)\s+([A-Za-z][a-zA-Z]{2,14})\b"
     r"|\bthis is\s+([A-Z][a-zA-Z]{2,14})\b(?=\s|$|[,.!?])", re.I)
+
+# join announcements: chat or read aloud ("X just joined", "X is here",
+# "X hopped in the call") — a voice that FIRST appears right after is X
+ANN = re.compile(
+    r"\b([A-Za-z][A-Za-z]{2,16})\b[^,.!?]{0,24}?"
+    r"\b(?:just\s+)?(?:joined|joins|joining|has joined|is here|came in|got here|"
+    r"got on|hopped in|hop in|hops in|jumped in|in the vc|in voice|"
+    r"on the call|in the call|on the vc)\b", re.I)
 
 # words that get capitalized but are not names (extend conservatively —
 # a false name costs trust; a missed name costs nothing)
@@ -214,6 +226,26 @@ def run(jobdir, force=False):
     except Exception:
         pass
 
+    # --- join announcements: "X just joined" -> lane that STARTS speaking ----
+    first_t = {}
+    for t, lane, _ in turns:
+        if lane not in first_t:
+            first_t[lane] = t
+    events = [(float(c.get("t", 0) or 0), c.get("text") or "", "chat")
+              for c in chat]
+    events += [(t, text, "voice") for t, _, text in turns]
+    for et, text, _src in events:
+        for m in ANN.finditer(text):
+            nm = m.group(1)
+            if not _ok_name(nm):
+                continue
+            # lanes whose FIRST utterance lands 0..15 s after the announcement
+            starters = [ln for ln, ft in first_t.items() if 0 <= ft - et <= 15
+                        and ln in people]
+            if len(starters) == 1:      # unambiguous newcomer
+                vote(starters[0], nm, et, "join", 2.0,
+                     f"{_src}: {text}")
+
     # --- chat-address -> next speaker reply latency ---------------------------
     turn_i = 0
     for c in chat:
@@ -245,6 +277,57 @@ def run(jobdir, force=False):
                 if _norm(nm) != _norm(lane):
                     vote(lane2, nm, t, "pair", 0.8, text)
 
+    # --- acoustic propagation: voice-identical lanes inherit a strong name ----
+    # frag_merge deliberately protects >=5-seg lanes from merging, so the SAME
+    # person re-split by diarization survives as two "people". If one side has
+    # a strong name and their voiceprint centroids match at cos>=0.55, the
+    # other side is (near-certainly) the same person — propagate it.
+    try:
+        import numpy as np
+        emb_p, idx_p, lab_p = (jobdir / "vp_emb2.npy", jobdir / "vp_idx2.json",
+                               jobdir / "vp_lab2.npy")
+        if emb_p.exists() and lab_p.exists() and votes:
+            E = np.load(emb_p, allow_pickle=True).astype(np.float32)
+            raw_lab = np.fromfile(lab_p, dtype="int32")
+            lane_of_row = {}
+            for pnm, pp in people.items():
+                if pnm != "(short)" and pp.get("lane") is not None:
+                    lane_of_row[pp["lane"]] = pnm
+            cents = {}
+            for L in np.unique(raw_lab):
+                nm = lane_of_row.get(int(L))
+                rows = np.where(raw_lab == L)[0]
+                if nm and len(rows):
+                    c = E[rows].mean(0)
+                    cents[nm] = c / max(np.linalg.norm(c), 1e-9)
+            strong = {}
+            for (vlane, vnn), v in votes.items():
+                # seed only from DIRECT evidence (self/channel/join): weak
+                # pair/reply junk must never launder itself via acoustic boost
+                vkinds = {ev["kind"] for ev in v["evidence"]}
+                if (v["score"] >= 2.0 and vlane in cents
+                        and vkinds <= {"self", "channel", "join"} and vkinds):
+                    cur = strong.get(vlane)
+                    if cur is None or v["score"] > cur["score"]:
+                        strong[vlane] = v
+            prop = []
+            for nm, c in cents.items():
+                if nm in strong:
+                    continue
+                best = None
+                for snm, sv in strong.items():
+                    s = float(c @ cents[snm])
+                    if s >= 0.55 and (best is None or s > best[1]):
+                        best = (snm, s)
+                if best:
+                    prop.append((nm, strong[best[0]], best))
+            for nm, sv, best in prop:
+                disp = max(sv["display"].items(), key=lambda kv: kv[1])[0]
+                vote(nm, disp, 0, "acoustic", 2.0,
+                     f"voiceprint cos {best[1]:.2f} vs {best[0]}")
+    except Exception:
+        pass
+
     # --- collapse: best name per lane + ambiguity margins --------------------
     by_lane = {}
     name_lanes = {}
@@ -268,12 +351,22 @@ def run(jobdir, force=False):
             "runners": [{"name": v["name"], "score": round(v["score"], 2)}
                         for v in vs[1:3]],
         }
-        # a name some OTHER lane claims stronger = contested
+        # a name some OTHER lane claims stronger = contested — EXCEPT when
+        # this lane's evidence is acoustic-only: an acoustic twin legitimately
+        # inherits the name the source lane earned outright
+        kinds = {ev["kind"] for ev in best["evidence"]}
         rivals = [w for w in name_lanes[_norm(disp)]
                   if w["lane"] != lane and w["score"] > best["score"]]
+        if kinds == {"acoustic"}:
+            rivals = []
         contested = bool(rivals) or entry["margin"] < 1.0
-        entry["confidence"] = ("high" if (not contested and best["score"] >= 2.0)
-                               else "low" if contested else "medium")
+        conf = ("high" if (not contested and best["score"] >= 2.0)
+                else "low" if contested else "medium")
+        # derived-only evidence (acoustic twin, lone join event) deserves
+        # less trust than a spoken self-intro, however tidy the numbers look
+        if conf == "high" and kinds <= {"acoustic"}:
+            conf = "medium"
+        entry["confidence"] = conf
         if hint and g_est and hint != g_est:
             entry["gender_mismatch"] = f"name reads {hint}, voice reads {g_est}"
         by_lane[lane] = entry
