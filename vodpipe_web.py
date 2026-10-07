@@ -342,6 +342,13 @@ def _merge_voice_gender(d, stats):
                 stats[nm]["voice_gender"] = g
                 stats[nm]["gender_confidence"] = "confirmed"
                 stats[nm]["gender_mismatch"] = False
+    # what they talked about (speaker_sums.py side file) rides along too
+    for nm, s in (_read_json_retry(d / "speaker_summaries.json") or {}).items():
+        if isinstance(s, dict) and s.get("sum"):
+            if nm not in stats and (d / "people.json").exists():
+                stats[nm] = {}          # fragment lanes: no voice profile, just the quote
+            stats[nm]["what"] = s["sum"]
+            stats[nm]["what_kind"] = s.get("kind")
     return stats
 
 
@@ -604,7 +611,7 @@ function personRow(nm,p,maxTalk){
   <td ${gc?`style="text-align:center;color:${gcol};font-size:14px;cursor:pointer" title="${esc(gtip)}" onclick="event.stopPropagation();trustSpoken(${jsq(nm)})"`:`title="${esc(gtip)} — click to set manually" style="text-align:center;color:${gcol};font-size:14px;cursor:pointer" onclick="event.stopPropagation();setGender(${jsq(nm)})"`}>${gsym}${v.gender_mismatch&&!gc?'⚠':''}</td>
   <td class=lane>${nameCell}</td>
   <td style="white-space:nowrap">${hms(p.talk_seconds)} · ${p.n_segments}s ${talkBar(p.talk_seconds,maxTalk)}</td>
-  <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)">${esc(v.desc||(frag?'fragment — too brief to profile':'profile pending…'))}</td>
+  <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)" title="${esc(v.desc||'')}">${v.what?esc(v.what):esc(frag?'fragment — too brief to profile':(v.desc||'profile pending…'))}</td>
   <td>${solo>=0?'<span class="st done" title="solo voice clip ready">✓ clip</span>':'<span style="opacity:.35" title="no solo track (lane below threshold)">—</span>'}</td>
   <td><button onclick="openLane(${jsq(nm)})">open</button></td></tr>`}
 function renderPeople(){
@@ -822,6 +829,7 @@ async function openLane(nm,keep){
  let html=`<span class=back onclick=closeLane()>← all people</span>
   <h2>${esc(nm)} <span style="font-weight:400;font-size:12px;color:var(--muted-foreground)">(${hms(v.talk_seconds||0)} talk · ${v.segs||'?'} segs${v.joined_late?' · joined late':''})</span></h2>`;
  if(v.desc)html+=`<div style="font-size:13px;color:var(--accent,#8b8bff);margin:2px 0 8px">${esc(v.desc)}</div>`;
+ if(v.what)html+=`<div style="font-size:13px;margin:2px 0 8px">🗨 ${esc(v.what)}${v.what_kind==='quote'?' <span style=opacity:.5>(their exact words)</span>':""}</div>`;
  if(i>=0)html+=`<audio controls preload=metadata src="/media/${_jobId}/solo_${i}_solo.wav"></audio>
    <div style="font-size:11px;color:var(--muted-foreground)">solo track — only ${esc(nm)}'s segments, stitched; timestamps stay in original VOD time via "clean" tab below</div>`;
  else html+='<i style="opacity:.6">no solo track (lane below solo threshold)</i>';

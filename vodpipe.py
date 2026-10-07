@@ -536,6 +536,13 @@ def main():
             print(f"[vodpipe] ✓ LLM gender mining ({len(g.get('entries', []))} entries, {g.get('secs')} s)")
         except Exception as e:
             print(f"[vodpipe] LLM name mining skipped: {str(e)[:100]}")
+        try:  # optional: per-speaker "what did they talk about" summaries
+            import speaker_sums
+            s = speaker_sums.run(job.dir, force=True)
+            n = sum(1 for v in s.values() if isinstance(v, dict) and v.get("sum"))
+            print(f"[vodpipe] ✓ speaker summaries ({n} speakers, {s.get('_secs')} s)")
+        except Exception as e:
+            print(f"[vodpipe] speaker summaries skipped: {str(e)[:100]}")
         try:  # cheap, non-fatal: probable names from context (side-file only)
             import name_suggest
             r = name_suggest.run(job.dir, force=True)
