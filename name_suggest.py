@@ -344,10 +344,26 @@ def run(jobdir, force=False):
     try:
         llm = json.loads((jobdir / "names_llm.json").read_text(encoding="utf-8"))
         for v in llm.get("votes", []):
+            kind = v.get("kind")
+            # gender statements are attributed to LANES, not names — they
+            # carry a gendered word ("girl", "guy") or nothing as `name`,
+            # so they must skip the name validator entirely
+            if kind == "gender":
+                said = (v.get("said") or "").lower()
+                if said not in ("male", "female"):
+                    continue
+                who = v.get("target") or v.get("speaker")
+                if who in people:
+                    spoken_g[who][said] += 1
+                    nm = v.get("name")
+                    # a gendered nickname that IS the name links name+lane
+                    if nm and _ok_name(nm):
+                        vote(who, nm, float(v.get("ts") or 0),
+                             "llm-address", 1.2, f"llm: {v.get('quote') or ''}")
+                continue
             nm = v.get("name")
             if not nm or not _ok_name(nm.split()[-1]) and not _ok_name(nm):
                 continue
-            kind = v.get("kind")
             t = float(v.get("ts") or 0)
             quote = f"llm: {v.get('quote') or ''}"
             if kind == "self":
@@ -368,18 +384,20 @@ def run(jobdir, force=False):
                                 if 0 <= ft - t <= 15 and ln in people]
                     if len(starters) == 1:
                         vote(starters[0], nm, t, "llm-join", 2.0, quote)
-            elif kind == "gender":
-                said = (v.get("said") or "").lower()
-                if said not in ("male", "female"):
-                    continue
-                who = v.get("target") or v.get("speaker")
-                if who in people:
-                    spoken_g[who][said] += 1
-                    # a gendered nickname that IS the name links name+lane
-                    if _ok_name(nm):
-                        vote(who, nm, t, "llm-address", 1.2, quote)
     except FileNotFoundError:
         pass
+    except Exception:
+        pass
+    # --- dedicated gender pass (llm_names.gender_run, names_gender.json) ----
+    # Focused prompt: quotes guaranteed to contain gendered words, attributed
+    # to the lane of the PERSON REFERRED TO via dialogue flow.
+    try:
+        gp = json.loads((jobdir / "names_gender.json").read_text(encoding="utf-8"))
+        for v in gp.get("entries", []):
+            said = (v.get("said") or "").lower()
+            lane = v.get("lane")
+            if said in ("male", "female") and lane in people:
+                spoken_g[lane][said] += 1
     except Exception:
         pass
 

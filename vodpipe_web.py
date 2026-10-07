@@ -600,7 +600,7 @@ function personRow(nm,p,maxTalk){
  const nameCell=ov?`<span title="confirmed name for ${esc(nm)}" style="color:#7ee08a;font-weight:700">${esc(ov)}</span> <span style="opacity:.45;font-size:10px">${esc(nm)}</span>`
   :esc(nm)+`${p.joined_late?' <span style=font-size:10px>late</span>':''}${ns?` <span title="${nmTip}" style="color:#7ee08a;font-weight:600;cursor:pointer" onclick="event.stopPropagation();applyName(${jsq(nm)},${jsq(ns.name)})">💡${esc(ns.name)}</span>`:''}`;
  return `<tr${frag?' style="opacity:.55"':''}>
-  <td ${gc?`style="text-align:center;color:${gcol};font-size:14px;cursor:pointer" title="${esc(gtip)}" onclick="event.stopPropagation();trustSpoken(${jsq(nm)})"`:`title="${esc(gtip)}" style="text-align:center;color:${gcol};font-size:14px"`}>${gsym}${v.gender_mismatch&&!gc?'⚠':''}</td>
+  <td ${gc?`style="text-align:center;color:${gcol};font-size:14px;cursor:pointer" title="${esc(gtip)}" onclick="event.stopPropagation();trustSpoken(${jsq(nm)})"`:`title="${esc(gtip)} — click to set manually" style="text-align:center;color:${gcol};font-size:14px;cursor:pointer" onclick="event.stopPropagation();setGender(${jsq(nm)})"`}>${gsym}${v.gender_mismatch&&!gc?'⚠':''}</td>
   <td class=lane>${nameCell}</td>
   <td style="white-space:nowrap">${hms(p.talk_seconds)} · ${p.n_segments}s ${talkBar(p.talk_seconds,maxTalk)}</td>
   <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)">${esc(v.desc||(frag?'fragment — too brief to profile':'profile pending…'))}</td>
@@ -847,6 +847,14 @@ async function trustSpoken(lane){
  try{await j(`/api/job/${_jobId}/gender_override`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lane,gender:g.spoken})});
   try{_voice=await j(`/api/job/${_jobId}/voices`);}catch(e){}
   renderPeople();if(_lane)openLane(_lane);}catch(e){alert('gender confirm failed: '+e)}
+}
+async function setGender(lane){
+ const cur=(_voice[lane]||{}).voice_gender||'';
+ const g=(prompt(`Set gender for ${lane} (you know what a voice changer sounds like; the machine doesn't).\n${cur?'Currently: '+cur+'\n':''}Type male, female, or ambiguous — leave empty to clear the override:`,'')||'').trim().toLowerCase();
+ if(g&&!['male','female','ambiguous'].includes(g)){alert('must be male, female, or ambiguous');return}
+ try{await j(`/api/job/${_jobId}/gender_override`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lane,gender:g})});
+  try{_voice=await j(`/api/job/${_jobId}/voices`);}catch(e){}
+  renderPeople();if(_lane)openLane(_lane);}catch(e){alert('gender set failed: '+e)}
 }
 async function cancelJob(){
  if(!confirm('Cancel this job? Downloaded/transcribed work stays on disk; re-running resumes.'))return;

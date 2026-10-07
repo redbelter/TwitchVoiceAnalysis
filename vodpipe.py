@@ -531,7 +531,9 @@ def main():
         try:  # optional (needs LAN LLM): qwen3.8 mines names+gender hints (~2-5 s/chunk)
             import llm_names
             r = llm_names.run(job.dir, force=True)
-            print(f"[vodpipe] ✓ LLM name mining ({len(r['votes'])} votes, {r['elapsed_s']} s)")
+            print(f"[vodpipe] ✓ LLM name mining ({len(r.get('votes', []))} votes, {r.get('secs')} s)")
+            g = llm_names.gender_run(job.dir, force=True)
+            print(f"[vodpipe] ✓ LLM gender mining ({len(g.get('entries', []))} entries, {g.get('secs')} s)")
         except Exception as e:
             print(f"[vodpipe] LLM name mining skipped: {str(e)[:100]}")
         try:  # cheap, non-fatal: probable names from context (side-file only)
