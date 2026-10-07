@@ -590,7 +590,8 @@ function personRow(nm,p,maxTalk){
           'male':['♂','#58a6ff','voice-based estimate: male'],
           'ambiguous':['?','#d29922','pitch in the male/female overlap zone']}[v.voice_gender]||['·','#555','pitch not measured'];
  const ns=_names[nm],ov=_nameOv[nm];
- const gc=ns&&ns.gender_conflict&&v.gender_confidence!=='confirmed';
+ const gcf=ns&&ns.gender_conflict;
+ const gc=(gcf&&v.gender_confidence!=='confirmed')?gcf:null;
  const gsym=gc?(gc.spoken==='female'?'♀':'♂'):G[0];
  const gcol=gc?(gc.spoken==='female'?'#f778ba':'#58a6ff'):G[1];
  let gtip=gc?`call says ${gc.spoken} (${gc.votes.male||0}♂ / ${gc.votes.female||0}♀ statements), pitch reads ${gc.acoustic} — click to trust the call`
@@ -667,11 +668,12 @@ async function start(){
  $('#url').value='';$('#seed').value='';setTimeout(tick,1200);
 }
 async function tick(){
- if(!$('#jobs'))return;
- tickQueues().catch(()=>{});
- let jobs=[];
- try{jobs=await j('/api/jobs');}catch(e){_timer=setTimeout(tick,3000);return;}
- $('#jobs').innerHTML=jobs.map(J=>{
+if(!$('#jobs'))return;
+tickQueues().catch(()=>{});
+let jobs=[];
+try{jobs=await j('/api/jobs');}catch(e){_timer=setTimeout(tick,3000);return;}
+if(!$('#jobs'))return;   // user opened a job page while we awaited — this paint is moot
+$('#jobs').innerHTML=jobs.map(J=>{
   const st=J.stages||{};let n=0;
   const vals=Object.values(st);
   for(const s of STAGES) if(st[s]&&st[s].status==='done')n++;
@@ -777,7 +779,10 @@ async function jobTick(){
    _people=Object.entries(P).sort((a,b)=>b[1].talk_seconds-a[1].talk_seconds);
    try{_voice=await j(`/api/job/${_jobId}/voices`);}catch(e){_voice={};}
    try{const N=await j(`/api/job/${_jobId}/names`);_names=(N&&N.proposals)||{};_nameOv=(N&&N.overrides)||{};}catch(e){_names={};_nameOv={};}
-   _peopleKey=pk; renderPeople();
+   _peopleKey=pk;
+   try{renderPeople();}
+   catch(e){_peopleKey=null;   // let the next tick retry — never leave the section silently blank
+    const pb=$('#peoplebox');if(pb)pb.innerHTML=`<h2>People</h2><div style="color:#ff7b72">render error: ${esc(String(e&&e.message||e))}</div>`;}
   } else if(settled&&!_voiceDone){
    try{const v=await j(`/api/job/${_jobId}/voices`);
     if(Object.keys(v).length){_voice=v;_voiceDone=true;renderPeople();if(_lane)openLane(_lane);}}catch(e){}
