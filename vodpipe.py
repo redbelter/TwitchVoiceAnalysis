@@ -528,6 +528,12 @@ def main():
             print("[vodpipe] ✓ voice profiles (voice_stats.json)")
         except Exception as e:
             print(f"[vodpipe] voice profiles skipped: {str(e)[:100]}")
+        try:  # cheap, non-fatal: probable names from context (side-file only)
+            import name_suggest
+            r = name_suggest.run(job.dir, force=True)
+            print(f"[vodpipe] ✓ name suggestions ({len(r['proposals'])} proposals)")
+        except Exception as e:
+            print(f"[vodpipe] name suggestions skipped: {str(e)[:100]}")
         print(f"[vodpipe] JOB COMPLETE: {job.dir}")
     finally:
         lk = workdir / "gpu.lock"

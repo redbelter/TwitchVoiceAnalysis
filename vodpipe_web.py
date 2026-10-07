@@ -251,7 +251,7 @@ def api_job(jid: str):
     st["id"] = st.get("id") or jid
     st["_artifacts"] = {n: (d / n).exists() for n in
                         ("labeled.txt", "people.json", "scan_flirting.txt",
-                         "chat.json", "voice_stats.json")}
+                         "chat.json", "voice_stats.json", "names_suggested.json")}
     meta_p = d / "meta.json"
     if meta_p.exists():
         st["_meta"] = _read_json_retry(meta_p)
@@ -312,6 +312,52 @@ def api_voices(jid: str):
         return voice_stats.run(d)
     except Exception as e:
         raise HTTPException(500, f"voice stats failed: {str(e)[:200]}")
+
+
+@app.get("/api/job/{jid}/names")
+def api_names(jid: str):
+    """Probable display names per lane, inferred from self-intros, chat
+    greetings + reply latency, and turn pairs. Side file only — people.json
+    is never rewritten; --seed stays the source of truth."""
+    d = job_dir(jid)
+    cached = d / "names_suggested.json"
+    res = None
+    if cached.exists():
+        res = _read_json_retry(cached) or {}
+    elif (d / "labeled.txt").exists():
+        try:
+            import name_suggest
+            res = name_suggest.run(d)
+        except Exception as e:
+            raise HTTPException(500, f"name suggestion failed: {str(e)[:200]}")
+    if res is None:
+        res = {}
+    ov = _read_json_retry(d / "name_overrides.json") or {}
+    res["overrides"] = ov
+    return res
+
+
+@app.post("/api/job/{jid}/confirm_name")
+async def api_confirm_name(jid: str, body: dict):
+    """Human confirms a suggested name: stored in name_overrides.json (a
+    side file the dashboard merges over labels). Pipeline artifacts and
+    labeled.txt are never rewritten by this."""
+    lane = str(body.get("lane") or "").strip()
+    name = str(body.get("name") or "").strip()
+    if not lane:
+        raise HTTPException(400, "lane required")
+    d = job_dir(jid)
+    p = d / "name_overrides.json"
+    ov = _read_json_retry(p) or {}
+    if name:
+        if len(name) > 40:
+            raise HTTPException(400, "name too long")
+        ov[lane] = name
+    else:
+        ov.pop(lane, None)          # empty name = undo the confirmation
+    from vodpipe import atomic_write
+    atomic_write(p, json.dumps(ov, indent=1, ensure_ascii=False))
+    return {"ok": True, "overrides": ov}
 
 
 @app.get("/api/job/{jid}/transcript")
@@ -436,7 +482,7 @@ function jsq(s){return esc(JSON.stringify(s)).replace(/"/g,'&quot;')}
 const hms=t=>{t|=0;return String(t/3600|0).padStart(2,0)+':'+String(t%3600/60|0).padStart(2,0)+':'+String(t%60).padStart(2,0)};
 const STAGES=['download','audio','transcribe','diarize','voiceprint','label','frag','solos','reasr','clean','scan'];
 async function j(u,o){return (await fetch(u,o)).json()}
-let _jobId=null,_people=[],_lane=null,_timer=null,_voice={},_peopleKey=null,_voiceDone=false,_lanes=[],_meta=null,_hasChat=false;
+let _jobId=null,_people=[],_lane=null,_timer=null,_voice={},_peopleKey=null,_voiceDone=false,_lanes=[],_meta=null,_hasChat=false,_names={},_nameOv={};
 let _watchKey=null,_wt=[],_wc=[],_wCurT=-1,_wCurC=-1,_wFollow=true;
 const wm=()=>$('#wmed');
 function wcolor(nm){let h=0;for(const c of String(nm))h=(h*31+c.charCodeAt(0))%360;return `hsl(${h} 62% 68%)`}
@@ -489,9 +535,13 @@ function personRow(nm,p,maxTalk){
  const G={'female':['♀','#f778ba','voice-based estimate: female'],
           'male':['♂','#58a6ff','voice-based estimate: male'],
           'ambiguous':['?','#d29922','pitch in the male/female overlap zone']}[v.voice_gender]||['·','#555','pitch not measured'];
+ const ns=_names[nm],ov=_nameOv[nm];
+ const nmTip=ns?`name suggested from context (${esc(ns.confidence)} confidence):\n${esc((ns.evidence[0]?ns.evidence[0].kind+': '+ns.evidence[0].quote:''))}`:'';
+ const nameCell=ov?`<span title="confirmed name for ${esc(nm)}" style="color:#7ee08a;font-weight:700">${esc(ov)}</span> <span style="opacity:.45;font-size:10px">${esc(nm)}</span>`
+  :esc(nm)+`${p.joined_late?' <span style=font-size:10px>late</span>':''}${ns?` <span title="${nmTip}" style="color:#7ee08a;font-weight:600;cursor:pointer" onclick="event.stopPropagation();applyName(${jsq(nm)},${jsq(ns.name)})">💡${esc(ns.name)}</span>`:''}`;
  return `<tr${frag?' style="opacity:.55"':''}>
   <td title="${G[2]}${v.f0?' ('+v.f0+' Hz)':''}" style="text-align:center;color:${G[1]};font-size:14px">${G[0]}</td>
-  <td class=lane>${esc(nm)}${p.joined_late?' <span style=font-size:10px>late</span>':''}</td>
+  <td class=lane>${nameCell}</td>
   <td style="white-space:nowrap">${hms(p.talk_seconds)} · ${p.n_segments}s ${talkBar(p.talk_seconds,maxTalk)}</td>
   <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)">${esc(v.desc||(frag?'fragment — too brief to profile':'profile pending…'))}</td>
   <td>${solo>=0?'<span class="st done" title="solo voice clip ready">✓ clip</span>':'<span style="opacity:.35" title="no solo track (lane below threshold)">—</span>'}</td>
@@ -590,7 +640,7 @@ async function openFolder(id){await j(`/api/job/${id}/open`,{method:'POST'});}
 /* ---------------- live job view ---------------- */
 function stopTimer(){if(_timer){clearTimeout(_timer);_timer=null}}
 async function openJob(id){
- stopTimer();_jobId=id;_lane=null;_meta=null;_hasChat=false;_watchKey=null;_wt=[];_wc=[];_peopleKey=null;_voiceDone=false;_voice={};
+ stopTimer();_jobId=id;_lane=null;_meta=null;_hasChat=false;_watchKey=null;_wt=[];_wc=[];_peopleKey=null;_voiceDone=false;_voice={};_names={};_nameOv={};
  $('#app').innerHTML=`<span class=back onclick="location.hash='';jobsView()">← jobs</span>
   <h1 id=jtitle>${id}</h1><div id=metabox></div><div id=watch></div><div id=prog></div><div id=logbox></div>
   <div id=peoplebox></div><div id=lanebox></div>
@@ -666,10 +716,13 @@ async function jobTick(){
    const P=await j(`/api/job/${_jobId}/people`);
    _people=Object.entries(P).sort((a,b)=>b[1].talk_seconds-a[1].talk_seconds);
    try{_voice=await j(`/api/job/${_jobId}/voices`);}catch(e){_voice={};}
+   try{const N=await j(`/api/job/${_jobId}/names`);_names=(N&&N.proposals)||{};_nameOv=(N&&N.overrides)||{};}catch(e){_names={};_nameOv={};}
    _peopleKey=pk; renderPeople();
   } else if(settled&&!_voiceDone){
    try{const v=await j(`/api/job/${_jobId}/voices`);
     if(Object.keys(v).length){_voice=v;_voiceDone=true;renderPeople();if(_lane)openLane(_lane);}}catch(e){}
+   try{const N=await j(`/api/job/${_jobId}/names`);
+    if(N&&(N.proposals||N.overrides)){_names=N.proposals||{};_nameOv=N.overrides||{};renderPeople();if(_lane)openLane(_lane);}}catch(e){}
   }
  }
  $('#searchbox').innerHTML=$('#searchbox').innerHTML||
@@ -722,6 +775,11 @@ async function openLane(nm,keep){
  }catch(e){const tb=$('#laneHits');if(tb)tb.innerHTML='<tr><td style="color:#ff7b72">transcript load failed — retry</td></tr>';}
 }
 function closeLane(){_lane=null;renderPeople();}
+async function applyName(lane,name){
+ if(!confirm(`Confirm "${name}" as the name for ${lane}?\nStored as a label override (artifacts untouched).`))return;
+ try{const r=await j(`/api/job/${_jobId}/confirm_name`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lane,name})});
+  if(r&&r.overrides){_nameOv=r.overrides;renderPeople();if(_lane)openLane(_lane);}}catch(e){alert('confirm failed: '+e)}
+}
 async function cancelJob(){
  if(!confirm('Cancel this job? Downloaded/transcribed work stays on disk; re-running resumes.'))return;
  const r=await j(`/api/job/${_jobId}/cancel`,{method:'POST'});
