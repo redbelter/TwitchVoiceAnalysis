@@ -68,15 +68,33 @@ def run(jobdir, force=False):
     if not llm_names._endpoint_up():
         return {"skipped": f"endpoint down: {llm_names.URL}"}
     people = json.loads((jobdir / "people.json").read_text(encoding="utf-8"))
+    # gender precedence for pronoun hints (same as the UI):
+    #   human override > spoken majority from the call > acoustic estimate
+    # (voice changers fool pitch+formants; pronouns spoken about a person don't)
     gmap = {}
-    for f in ("voice_gender.json",):
-        try:
-            for k, v in json.loads((jobdir / f).read_text(encoding="utf-8")).items():
-                if isinstance(v, dict) and v.get("voice_gender"):
-                    gmap[k] = v["voice_gender"]
-        except Exception:
-            pass
-    try:  # human-confirmed gender wins over the estimate
+    try:
+        for k, v in json.loads((jobdir / "voice_gender.json").read_text(encoding="utf-8")).items():
+            if isinstance(v, dict) and v.get("voice_gender"):
+                gmap[k] = v["voice_gender"]
+    except Exception:
+        pass
+    try:
+        from collections import Counter
+        gp = json.loads((jobdir / "names_gender.json").read_text(encoding="utf-8"))
+        votes = {}
+        for v in gp.get("entries", []):
+            lane, said = v.get("lane"), v.get("said")
+            if lane and said in ("male", "female"):
+                votes.setdefault(lane, Counter())[said] += 1
+        for lane, c in votes.items():
+            top = c.most_common(2)
+            first, second = top[0][1], (top[1][1] if len(top) > 1 else 0)
+            # strict majority of gender statements, minimum 2; a tie stays unknown
+            if first >= 2 and first > second:
+                gmap[lane] = top[0][0]
+    except Exception:
+        pass
+    try:  # human-confirmed gender wins over everything
         gmap.update({k: v for k, v in json.loads(
             (jobdir / "gender_overrides.json").read_text(encoding="utf-8")).items()
             if v in ("male", "female")})

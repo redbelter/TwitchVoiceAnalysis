@@ -447,8 +447,13 @@ def run(jobdir, force=False):
         # lie — pitch shifters, voice training). Majority vote of gender
         # statements attributed to this lane.
         sg = spoken_g.get(lane)
-        if sg and sum(sg.values()) >= 2:
-            sg_maj = sg.most_common(1)[0][0]
+        if sg:
+            _t = sg.most_common(2)
+            _f, _s = _t[0][1], (_t[1][1] if len(_t) > 1 else 0)
+            sg_maj = _t[0][0] if (_f >= 2 and _f > _s) else None
+        else:
+            sg_maj = None
+        if sg_maj:
             acoustic = ((vg_est.get(lane) or {}).get("voice_gender")
                         or (voice.get(lane) or {}).get("voice_gender"))
             if acoustic == "ambiguous" or acoustic is None:
