@@ -482,7 +482,7 @@ def media(jid: str, name: str):
 
 INDEX = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VODPipe</title><style>
+<title>VODPipe</title><link rel="icon" href="/favicon.ico"><style>
 :root{font-family:system-ui,sans-serif}
 body{margin:0;padding:24px;background:var(--card,#101014);color:var(--foreground,#e8e8ea)}
 *{box-sizing:border-box}
@@ -884,6 +884,15 @@ function route(){const h=location.hash.slice(1);h.startsWith('job/')?openJob(h.s
 window.onhashchange=route;
 route();
 </script></body></html>"""
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    p = Path(__file__).resolve().parent / "favicon.ico"
+    if not p.exists():
+        raise HTTPException(404)
+    return FileResponse(p, media_type="image/x-icon",
+                        headers={"cache-control": "max-age=86400"})
 
 
 @app.get("/", response_class=HTMLResponse)
