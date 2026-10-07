@@ -421,7 +421,12 @@ details summary{cursor:pointer;color:var(--muted-foreground,#9a9aa2);font-size:1
 <div id=app>Loading…</div>
 <script>
 const $=s=>document.querySelector(s);
-const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+// JSON.stringify handles quotes/backslashes; swap its double-quotes for
+// entities so it survives sitting inside an onclick="..." attribute.
+// No literal backslashes here on purpose: this JS lives in a plain Python
+// string, where \\ decodes to \ before the browser ever sees it.
+function jsq(s){return esc(JSON.stringify(s)).replace(/"/g,'&quot;')}
 const hms=t=>{t|=0;return String(t/3600|0).padStart(2,0)+':'+String(t%3600/60|0).padStart(2,0)+':'+String(t%60).padStart(2,0)};
 const STAGES=['download','audio','transcribe','diarize','voiceprint','label','frag','solos','reasr','clean','scan'];
 async function j(u,o){return (await fetch(u,o)).json()}
@@ -480,7 +485,7 @@ function personRow(nm,p,maxTalk){
   <td style="white-space:nowrap">${hms(p.talk_seconds)} · ${p.n_segments}s ${talkBar(p.talk_seconds,maxTalk)}</td>
   <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)">${esc(v.desc||(frag?'fragment — too brief to profile':'profile pending…'))}</td>
   <td>${solo>=0?'<span class="st done" title="solo voice clip ready">✓ clip</span>':'<span style="opacity:.35" title="no solo track (lane below threshold)">—</span>'}</td>
-  <td><button onclick="openLane('${esc(nm)}')">open</button></td></tr>`}
+  <td><button onclick="openLane(${jsq(nm)})">open</button></td></tr>`}
 function renderPeople(){
  const box=$('#peoplebox');if(!box||_lane)return;   // never clobber an open lane
  const majors=_people.filter(([,p])=>p.n_segments>=5);
@@ -543,8 +548,9 @@ async function start(){
 }
 async function tick(){
  if(!$('#jobs'))return;
- tickQueues();
- const jobs=await j('/api/jobs');
+ tickQueues().catch(()=>{});
+ let jobs=[];
+ try{jobs=await j('/api/jobs');}catch(e){_timer=setTimeout(tick,3000);return;}
  $('#jobs').innerHTML=jobs.map(J=>{
   const st=J.stages||{};let n=0;
   const vals=Object.values(st);
@@ -583,10 +589,14 @@ async function openJob(id){
 }
 async function jobTick(){
  if(_jobId===null||!$('#prog'))return;
- const J=await j('/api/job/'+_jobId);
+ let J=null;
+ try{J=await j('/api/job/'+_jobId);}
+ catch(e){_timer=setTimeout(jobTick,2500);return;}   // one hiccup must never kill the loop
  _lanes=J.lanes||_lanes;
+ let n=0;                       // hoisted: used by the re-arm after the try
+ try{
  const st=J.stages||{};
- let n=0,act=null;
+ let act=null;
  for(const s of STAGES){const v=st[s];
   if(v&&v.status==='done')n++;
   else if(!act){const subs=Object.keys(st).filter(k=>k.startsWith(s+':'));
@@ -670,12 +680,15 @@ async function jobTick(){
  if(art['labeled.txt']&&wk!==_watchKey){_watchKey=wk;await renderWatch(J);}
  if(art['scan_flirting.txt']&&!$('#scanbox').innerHTML){const S=await j(`/api/job/${_jobId}/scan`);
   $('#scanbox').innerHTML=`<h2>Scans</h2><details><summary>register scan (flirting etc.)</summary><pre>${esc(S.text)}</pre></details>`;}
+ }catch(e){/* a render error must never stop the poll loop */}
  _timer=setTimeout(jobTick,n===STAGES.length?15000:2500);
 }
 
 async function openLane(nm,keep){
- _lane=nm;const J=await j('/api/job/'+_jobId);
- _lanes=J.lanes||[];
+ // NEVER fetch here: job state is already cached by jobTick (_lanes) — an
+ // await that rejects used to leave _lane set with nothing rendered, and
+ // every later click then died silently on the missing box.
+ _lane=nm;
  const i=_lanes.indexOf(nm);
  const v=_voice[nm]||{};
  let html=`<span class=back onclick=closeLane()>← all people</span>
@@ -685,10 +698,18 @@ async function openLane(nm,keep){
    <div style="font-size:11px;color:var(--muted-foreground)">solo track — only ${esc(nm)}'s segments, stitched; timestamps stay in original VOD time via "clean" tab below</div>`;
  else html+='<i style="opacity:.6">no solo track (lane below solo threshold)</i>';
  html+=`<table id=laneHits></table>`;
- const box=$('#laneBox2')||$('#lanebox');if(!box)return;
+ let box=$('#laneBox2');
+ if(!box){
+  if($('#peoplebox')){$('#peoplebox').insertAdjacentHTML('beforeend','<div id=laneBox2></div>');box=$('#laneBox2');}
+  else box=$('#lanebox');
+ }
+ if(!box){_lane=null;return;}   // page gone (navigated) — don't stay wedged
  box.innerHTML=html;
- const t=await j(`/api/job/${_jobId}/transcript?lane=${encodeURIComponent(nm)}&limit=500`);
- $('#laneHits').innerHTML=t.lines.map(l=>`<tr><td class=t>${hms(l.t)}</td><td>${esc(l.text)}</td></tr>`).join('');
+ try{
+  const t=await j(`/api/job/${_jobId}/transcript?lane=${encodeURIComponent(nm)}&limit=500`);
+  const tb=$('#laneHits');
+  if(tb)tb.innerHTML=t.lines.map(l=>`<tr><td class=t>${hms(l.t)}</td><td>${esc(l.text)}</td></tr>`).join('')||'<tr><td style=opacity:.5>no lines</td></tr>';
+ }catch(e){const tb=$('#laneHits');if(tb)tb.innerHTML='<tr><td style="color:#ff7b72">transcript load failed — retry</td></tr>';}
 }
 function closeLane(){_lane=null;renderPeople();}
 async function cancelJob(){
