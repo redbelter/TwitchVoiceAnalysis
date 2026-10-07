@@ -19,6 +19,8 @@ Stages (idempotent; skipped when the artifact exists):
  diarize    chunk_diar.py      [DIAR py] -> rttm.json   (speech-activity VAD)
  voiceprint vp_cluster.py     [DIAR py]  -> vp_emb2.npy + vp_lab2.npy
  label      label_voices.py              -> labeled.txt + people.json
+ frag       frag_merge.py                -> consolidated labels (fragments fold
+                                            into real speakers; drops stale solos)
  solos      solo_track.py per lane>=20   -> solo_N_solo.wav (+timeline.json)
  reasr      twitch_transcribe.py each    -> solo_N_solo.json/.txt
  clean      map_clean.py per lane        -> <label>_clean.txt (orig timestamps)
@@ -43,7 +45,7 @@ from pathlib import Path
 HERE = Path(__file__).parent
 DEFAULT_DIAR = os.environ.get("VODPIPE_DIAR_PY", "")
 STAGES = ["download", "audio", "transcribe", "diarize", "voiceprint",
-          "label", "solos", "reasr", "clean", "scan"]
+          "label", "frag", "solos", "reasr", "clean", "scan"]
 
 
 def job_id_for(s):
@@ -287,6 +289,12 @@ def stage_plan(job, name):
             cmd += ["--seed", s]
         return [("label", cmd,
                  lambda: J(d / "labeled.txt") and J(d / "people.json"))]
+    if name == "frag":
+        # fold voice fragments into established speakers (fast, numpy-only)
+        return [("frag",
+                 [py, HERE / "frag_merge.py", d],
+                 lambda: (d / "fragmerged.json").exists()
+                         or not (d / "vp_emb2.npy").exists())]
     if name == "solos":
         people = json.loads((d / "people.json").read_text(encoding="utf-8"))
         lanes = [nm for nm, p in sorted(people.items(), key=lambda x: -x[1]["talk_seconds"])

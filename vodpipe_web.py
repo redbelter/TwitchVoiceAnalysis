@@ -148,6 +148,12 @@ def api_job(jid: str):
     # stale parts from earlier runs can coexist)
     parts = list(d.glob("*.part"))
     st["_partial_mb"] = round(max((p.stat().st_size for p in parts), default=0) / 1048576)
+    # playable media for the watch view (source video if finalized, else audio)
+    vids = [p for p in d.glob("*.mp4") if p.stat().st_size > 1_000_000]
+    st["_video"] = max(vids, key=lambda p: p.stat().st_size).name if vids else None
+    st["_audio"] = "audio.mp3" if (d / "audio.mp3").exists() else None
+    fm = d / "fragmerged.json"
+    st["_frag"] = round(fm.stat().st_mtime) if fm.exists() else None
     return st
 
 
@@ -294,15 +300,64 @@ pre{white-space:pre-wrap;font-size:12px;background:var(--card,#15151a);
  padding:10px;border-radius:8px;border:1px solid var(--border,#2c2c34)}
 details summary{cursor:pointer;color:var(--muted-foreground,#9a9aa2);font-size:13px;margin:6px 0}
 .back{color:var(--accent,#8b8bff);cursor:pointer;font-size:13px}
+.wpane{max-height:46vh;overflow-y:auto;border:1px solid var(--border,#333);border-radius:6px;padding:6px 8px;font-size:13px;line-height:1.5}
+.wrow{padding:2px 5px;border-radius:4px;cursor:pointer}
+.wrow:hover{background:var(--card,#26262c)}
+.wrow.now{background:rgba(124,124,255,.20)}
+.wrow .t{opacity:.45;font-size:11px;font-family:ui-monospace,monospace}
 </style></head><body>
 <div id=app>Loading…</div>
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const hms=t=>{t|=0;return String(t/3600|0).padStart(2,0)+':'+String(t%3600/60|0).padStart(2,0)+':'+String(t%60).padStart(2,0)};
-const STAGES=['download','audio','transcribe','diarize','voiceprint','label','solos','reasr','clean','scan'];
+const STAGES=['download','audio','transcribe','diarize','voiceprint','label','frag','solos','reasr','clean','scan'];
 async function j(u,o){return (await fetch(u,o)).json()}
 let _jobId=null,_people=[],_lane=null,_timer=null,_voice={},_peopleKey=null,_voiceDone=false,_lanes=[],_meta=null,_hasChat=false;
+let _watchKey=null,_wt=[],_wc=[],_wCurT=-1,_wCurC=-1,_wFollow=true;
+const wm=()=>$('#wmed');
+function wcolor(nm){let h=0;for(const c of String(nm))h=(h*31+c.charCodeAt(0))%360;return `hsl(${h} 62% 68%)`}
+function wseek(t){const m=wm();if(m){m.currentTime=t;if(m.paused)m.play();}}
+function wsync(){
+ const m=wm();if(!m)return;const t=m.currentTime;
+ $('#wtime').textContent=hms(t);
+ const find=(arr,from)=>{let lo=from,hi=arr.length-1;           // walk-forward binary enough for monotonic time
+  if(from>=0&&from<arr.length&&arr[from].t<=t&&(from+1>=arr.length||arr[from+1].t>t))return from;
+  let a=0,b=arr.length-1,r=-1;while(a<=b){const mid=(a+b)>>1;if(arr[mid].t<=t){r=mid;a=mid+1}else b=mid-1}return r;};
+ for(const[pan,key]of[['#wtrans','T'],['#wchat','C']]){
+  const arr=key==='T'?_wt:_wc;let idx=find(arr,key==='T'?_wCurT:_wCurC);if(idx<0)continue;
+  if(key==='T')_wCurT=idx;else _wCurC=idx;
+  const el=$(pan);const rows=el.children;
+  if(rows[idx]){
+   if(el._cur!=null&&rows[el._cur]&&el._cur!==idx)rows[el._cur].classList.remove('now');
+   rows[idx].classList.add('now');el._cur=idx;
+   if(_wFollow)el.scrollTop=rows[idx].offsetTop-el.clientHeight/2;}}}
+async function renderWatch(J){
+ const src=J._video?J._video:(J._audio?J._audio:null);
+ if(!src)return;
+ const prev=wm()?wm().currentTime:0,wasPlay=wm()?!wm().paused:false;
+ $('#watch').innerHTML=`<video id=wmed controls preload=metadata src="/media/${_jobId}/${encodeURIComponent(src)}" style="width:100%;max-height:56vh;background:#000;border-radius:8px"></video>
+  <div style="display:flex;gap:10px;align-items:center;font-size:12px;margin:6px 0;color:var(--muted-foreground)">
+   <b id=wtime style="font-family:ui-monospace,monospace;color:var(--foreground)">00:00:00</b>
+   <select id=wspeed onchange="wm().playbackRate=+this.value" style="font-size:12px">${[0.75,1,1.25,1.5,2].map(r=>`<option${r===1?' selected':''}>${r}×</option>`).join('')}</select>
+   <label><input type=checkbox id=wfollow checked onchange="_wFollow=this.checked"> follow</label>
+   <span>click any line to jump there</span></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+   <div><h3 style="margin:2px 0 4px;font-size:13px">Transcript</h3><div id=wtrans class=wpane></div></div>
+   <div><h3 style="margin:2px 0 4px;font-size:13px">Chat <span id=wchatn style="font-weight:400;opacity:.5;font-size:11px"></span></h3><div id=wchat class=wpane></div></div></div>`;
+ const m=wm();m.addEventListener('timeupdate',wsync);m.addEventListener('seeked',wsync);
+ m.addEventListener('error',()=>{$('#wtime').textContent='media error — try a different file';});
+ for(const pane of['#wtrans','#wchat'])$(pane).addEventListener('wheel',()=>{_wFollow=false;const f=$('#wfollow');if(f)f.checked=false;},{passive:true});
+ _wt=(await j(`/api/job/${_jobId}/transcript?limit=99999`)).lines;
+ const C=await j(`/api/job/${_jobId}/chat?limit=5000`);
+ _wc=C.lines;
+ $('#wtrans').innerHTML=_wt.map(l=>`<div class=wrow data-t=${l.t} onclick="wseek(${l.t})"><span class=t>${hms(l.t)}</span> <b style="color:${wcolor(l.label)}">${esc(l.label)}</b> ${esc(l.text)}</div>`).join('')||'<i style=opacity:.5>annotations arrive as the pipeline finishes</i>';
+ $('#wchat').innerHTML=_wc.map(l=>`<div class=wrow data-t=${l.t} onclick="wseek(${l.t})"><span class=t>${hms(l.t)}</span> <b style="color:${wcolor(l.user)}">${esc(l.user)}</b> ${esc(l.text)}</div>`).join('')||'<i style=opacity:.5>no chat archive</i>';
+ $('#wchatn').textContent=C.total>_wc.length?`(showing ${_wc.length} of ${C.total})`:(C.total?`(${C.total})`:'');
+ _wCurT=_wCurC=-1;
+ if(prev){m.currentTime=prev;}if(wasPlay)m.play().catch(()=>{});
+ wsync();
+}
 function talkBar(sec,max){const w=Math.max(2,Math.min(100,sec/(max||1)*100));
  return `<span style="display:inline-block;height:5px;width:${w}%;max-width:120px;background:var(--accent,#5b5bd6);border-radius:3px;vertical-align:middle"></span>`}
 function personRow(nm,p,maxTalk){
@@ -392,9 +447,9 @@ async function tick(){
 /* ---------------- live job view ---------------- */
 function stopTimer(){if(_timer){clearTimeout(_timer);_timer=null}}
 async function openJob(id){
- stopTimer();_jobId=id;_lane=null;_meta=null;_hasChat=false;
+ stopTimer();_jobId=id;_lane=null;_meta=null;_hasChat=false;_watchKey=null;_wt=[];_wc=[];_peopleKey=null;_voiceDone=false;_voice={};
  $('#app').innerHTML=`<span class=back onclick="location.hash='';jobsView()">← jobs</span>
-  <h1 id=jtitle>${id}</h1><div id=metabox></div><div id=prog></div><div id=logbox></div>
+  <h1 id=jtitle>${id}</h1><div id=metabox></div><div id=watch></div><div id=prog></div><div id=logbox></div>
   <div id=peoplebox></div><div id=lanebox></div>
   <div id=searchbox></div><div id=chatbox></div><div id=scanbox></div>`;
  jobTick();
@@ -456,11 +511,12 @@ async function jobTick(){
    ${_meta.url?` · <a href="${esc(_meta.url)}" style="color:var(--accent,#8b8bff)" target=_blank>twitch ↗</a>`:''}</div>`;}
  if(art['people.json']){
   const settled=!running;                    // stable after pipeline settles
-  if(_peopleKey!==_jobId){
+  const pk=_jobId+':'+(J._frag||0);          // frag stage rewrites people.json
+  if(_peopleKey!==pk){
    const P=await j(`/api/job/${_jobId}/people`);
    _people=Object.entries(P).sort((a,b)=>b[1].talk_seconds-a[1].talk_seconds);
    try{_voice=await j(`/api/job/${_jobId}/voices`);}catch(e){_voice={};}
-   _peopleKey=_jobId; renderPeople();
+   _peopleKey=pk; renderPeople();
   } else if(settled&&!_voiceDone){
    try{const v=await j(`/api/job/${_jobId}/voices`);
     if(Object.keys(v).length){_voice=v;_voiceDone=true;renderPeople();if(_lane)openLane(_lane);}}catch(e){}
@@ -479,6 +535,9 @@ async function jobTick(){
    `<h2>Chat replay</h2><div style="display:flex;gap:8px;flex-wrap:wrap">
     <input id=cq placeholder="chat keyword…" style="flex:1;min-width:160px" onkeydown="if(event.key==='Enter')doChat()">
     <button onclick=doChat()>Search chat</button></div><table id=chathits></table>`;}
+ /* watch player: render once media + annotations exist; re-render if media or labels change */
+ const wk=_jobId+':'+(J._video||J._audio||'none')+':'+(J._frag||0);
+ if(art['labeled.txt']&&wk!==_watchKey){_watchKey=wk;await renderWatch(J);}
  if(art['scan_flirting.txt']&&!$('#scanbox').innerHTML){const S=await j(`/api/job/${_jobId}/scan`);
   $('#scanbox').innerHTML=`<h2>Scans</h2><details><summary>register scan (flirting etc.)</summary><pre>${esc(S.text)}</pre></details>`;}
  _timer=setTimeout(jobTick,n===STAGES.length?15000:2500);

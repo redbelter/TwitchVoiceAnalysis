@@ -6,14 +6,18 @@ runs the whole chain **autonomously and resumably**:
 ```
 download → extract audio → transcribe (Whisper large-v3, GPU)
         → diarize (NVIDIA Sortformer VAD) → voiceprint-cluster (TitaNet)
-        → label people → per-person "radio edit" solo tracks
+        → label people → fold voice fragments into real speakers
+        → per-person "radio edit" solo tracks
         → re-transcribe each solo track → clean per-person transcripts
         → register scans (keyword / flirting / etc.)
+        → VOD chat replay + stream metadata
 ```
 
-plus a local web dashboard: paste a URL, watch stages tick, click a person to
-**hear their isolated voice** and read their transcript with timestamps that
-deep-link back into the VOD.
+plus a local web dashboard with a **synced watch view**: the VOD playing with
+transcript and chat scrolling alongside it — click any line to jump there, and
+see exactly what chat said at that second. Paste a URL, watch stages tick,
+click a person to **hear their isolated voice** and read their transcript with
+timestamps that deep-link back into the VOD.
 
 Everything runs **locally on your GPU** (an 11 h VOD ≈ 90 min end-to-end on an
 RTX 4080, ≈2 GB VRAM during whisper). No cloud, no API keys.
@@ -94,6 +98,10 @@ gets stable `clNNNN` lanes.
 | `transcript.json/.txt/.srt` | full mixed transcript, segment timestamps |
 | `labeled.txt` | every line tagged `STREAMER` / person / `clNNNN` |
 | `people.json` | per-person talk-time, first/last seen, joined-late flag |
+| `fragmerged.json` | fragment→speaker consolidation stats (which one-shots folded where) |
+| `chat.json` / `chat.txt` | VOD chat replay, timestamped to the VOD clock |
+| `meta.json` | title / streamer / game / date / views (yt-dlp + Twitch GraphQL) |
+| `voice_stats.json` | per-person acoustic + style profile (pitch, wpm, airtime share) |
 | `solo_N_solo.wav` | one person's voice stitched across the whole VOD ("radio edit") |
 | `<lane>_clean.txt` | that person's re-transcribed speech with ORIGINAL video timestamps |
 | `scan_flirting.txt` | register-block extractor (generic; regex-editable) |
