@@ -316,11 +316,13 @@ def api_voices(jid: str):
 
 def _merge_voice_gender(d, stats):
     """Overlay the two-factor (pitch + vocal-tract formants) verdict from
-    voice_gender.json onto voice_stats, when available."""
+    voice_gender.json onto voice_stats, then any human-confirmed
+    gender_overrides.json on top of that."""
     vg_p = d / "voice_gender.json"
     if not vg_p.exists():
-        return stats
-    vg = _read_json_retry(vg_p) or {}
+        vg = {}
+    else:
+        vg = _read_json_retry(vg_p) or {}
     for nm, g in vg.items():
         if isinstance(g, dict) and nm in stats and g.get("voice_gender"):
             stats[nm]["voice_gender"] = g["voice_gender"]
@@ -331,6 +333,15 @@ def _merge_voice_gender(d, stats):
                 stats[nm]["gender_note"] = g["note"]
             if g.get("mismatch"):
                 stats[nm]["gender_mismatch"] = True
+    for nm, g in (_read_json_retry(d / "gender_overrides.json") or {}).items():
+        if g in ("male", "female", "ambiguous"):
+            if nm not in stats and (d / "people.json").exists():
+                # allow confirming gender even for lanes too quiet to profile
+                stats[nm] = {"desc": "gender confirmed from call context"}
+            if nm in stats:
+                stats[nm]["voice_gender"] = g
+                stats[nm]["gender_confidence"] = "confirmed"
+                stats[nm]["gender_mismatch"] = False
     return stats
 
 
@@ -375,6 +386,29 @@ async def api_confirm_name(jid: str, body: dict):
         ov[lane] = name
     else:
         ov.pop(lane, None)          # empty name = undo the confirmation
+    from vodpipe import atomic_write
+    atomic_write(p, json.dumps(ov, indent=1, ensure_ascii=False))
+    return {"ok": True, "overrides": ov}
+
+
+@app.post("/api/job/{jid}/gender_override")
+async def api_gender_override(jid: str, body: dict):
+    """Human confirms a spoken-gender verdict over the acoustic estimate
+    (voice changers fool pitch AND formants; what the call SAID about a
+    person doesn't). Stored in gender_overrides.json — artifacts untouched."""
+    lane = str(body.get("lane") or "").strip()
+    gender = str(body.get("gender") or "").strip().lower()
+    if not lane:
+        raise HTTPException(400, "lane required")
+    if gender and gender not in ("male", "female", "ambiguous"):
+        raise HTTPException(400, "gender must be male|female|ambiguous (or empty to undo)")
+    d = job_dir(jid)
+    p = d / "gender_overrides.json"
+    ov = _read_json_retry(p) or {}
+    if gender:
+        ov[lane] = gender
+    else:
+        ov.pop(lane, None)
     from vodpipe import atomic_write
     atomic_write(p, json.dumps(ov, indent=1, ensure_ascii=False))
     return {"ok": True, "overrides": ov}
@@ -556,12 +590,17 @@ function personRow(nm,p,maxTalk){
           'male':['♂','#58a6ff','voice-based estimate: male'],
           'ambiguous':['?','#d29922','pitch in the male/female overlap zone']}[v.voice_gender]||['·','#555','pitch not measured'];
  const ns=_names[nm],ov=_nameOv[nm];
- const gcTip=ns&&ns.gender_conflict?`\ncall says ${ns.gender_conflict.spoken}, voice reads ${ns.gender_conflict.acoustic} (${ns.gender_conflict.votes.male||0}♂/${ns.gender_conflict.votes.female||0}♀ statements)`:'';
+ const gc=ns&&ns.gender_conflict&&v.gender_confidence!=='confirmed';
+ const gsym=gc?(gc.spoken==='female'?'♀':'♂'):G[0];
+ const gcol=gc?(gc.spoken==='female'?'#f778ba':'#58a6ff'):G[1];
+ let gtip=gc?`call says ${gc.spoken} (${gc.votes.male||0}♂ / ${gc.votes.female||0}♀ statements), pitch reads ${gc.acoustic} — click to trust the call`
+   :`${G[2]}${v.f0?' ('+v.f0+' Hz)':''}${v.gfd?' · tract index '+v.gfd:''}${v.gender_note?' · '+esc(v.gender_note):''}`;
+ const gcTip=gc?`\ncall says ${gc.spoken}, voice reads ${gc.acoustic} (${gc.votes.male||0}♂/${gc.votes.female||0}♀ statements)`:'';
  const nmTip=ns?`name suggested from context (${esc(ns.confidence)} confidence):\n${esc((ns.evidence[0]?ns.evidence[0].kind+': '+ns.evidence[0].quote:''))}${esc(gcTip)}`:'';
  const nameCell=ov?`<span title="confirmed name for ${esc(nm)}" style="color:#7ee08a;font-weight:700">${esc(ov)}</span> <span style="opacity:.45;font-size:10px">${esc(nm)}</span>`
   :esc(nm)+`${p.joined_late?' <span style=font-size:10px>late</span>':''}${ns?` <span title="${nmTip}" style="color:#7ee08a;font-weight:600;cursor:pointer" onclick="event.stopPropagation();applyName(${jsq(nm)},${jsq(ns.name)})">💡${esc(ns.name)}</span>`:''}`;
  return `<tr${frag?' style="opacity:.55"':''}>
-  <td title="${G[2]}${v.f0?' ('+v.f0+' Hz)':''}${v.gfd?' · tract index '+v.gfd:''}${v.gender_note?' · '+esc(v.gender_note):''}" style="text-align:center;color:${G[1]};font-size:14px">${G[0]}${v.gender_mismatch?'⚠':''}</td>
+  <td ${gc?`style="text-align:center;color:${gcol};font-size:14px;cursor:pointer" title="${esc(gtip)}" onclick="event.stopPropagation();trustSpoken(${jsq(nm)})"`:`title="${esc(gtip)}" style="text-align:center;color:${gcol};font-size:14px"`}>${gsym}${v.gender_mismatch&&!gc?'⚠':''}</td>
   <td class=lane>${nameCell}</td>
   <td style="white-space:nowrap">${hms(p.talk_seconds)} · ${p.n_segments}s ${talkBar(p.talk_seconds,maxTalk)}</td>
   <td style="font-size:12px;color:var(--muted-foreground,#9a9aa2)">${esc(v.desc||(frag?'fragment — too brief to profile':'profile pending…'))}</td>
@@ -800,6 +839,14 @@ async function applyName(lane,name){
  if(!confirm(`Confirm "${name}" as the name for ${lane}?\nStored as a label override (artifacts untouched).`))return;
  try{const r=await j(`/api/job/${_jobId}/confirm_name`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lane,name})});
   if(r&&r.overrides){_nameOv=r.overrides;renderPeople();if(_lane)openLane(_lane);}}catch(e){alert('confirm failed: '+e)}
+}
+async function trustSpoken(lane){
+ const ns=_names[lane];if(!ns||!ns.gender_conflict)return;
+ const g=ns.gender_conflict;
+ if(!confirm(`The call said this about ${lane}:\n  ${g.votes.male||0} male / ${g.votes.female||0} female statements\nbut the pitch reads ${g.acoustic}.\n\nTrust the call and store "${g.spoken}" as this voice's gender?`))return;
+ try{await j(`/api/job/${_jobId}/gender_override`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lane,gender:g.spoken})});
+  try{_voice=await j(`/api/job/${_jobId}/voices`);}catch(e){}
+  renderPeople();if(_lane)openLane(_lane);}catch(e){alert('gender confirm failed: '+e)}
 }
 async function cancelJob(){
  if(!confirm('Cancel this job? Downloaded/transcribed work stays on disk; re-running resumes.'))return;
